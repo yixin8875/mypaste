@@ -1053,13 +1053,14 @@ mod tests {
         let c = Capture::text("来自合成应用".into())
             .unwrap()
             .with_source("synthetic.exe".into());
-        let id = store.capture(&c, now()).unwrap();
+        let base = now();
+        let id = store.capture(&c, base).unwrap();
         assert_eq!(store.get(id).unwrap().source, "synthetic.exe");
-        store.mark_used(id, now() + 5).unwrap();
-        store.mark_used(id, now() + 9).unwrap();
+        store.mark_used(id, base + 5).unwrap();
+        store.mark_used(id, base + 9).unwrap();
         let used = store.get(id).unwrap();
         assert_eq!(used.use_count, 2);
-        assert_eq!(used.last_used_at, Some(now() + 9));
+        assert_eq!(used.last_used_at, Some(base + 9));
         assert!(store.thumbnail(id).is_err());
     }
     #[test]
