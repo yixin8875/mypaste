@@ -1,0 +1,63 @@
+{
+  "checkedAt": "2026-11-08T05:48:28.019Z",
+  "checks": [
+    {
+      "name": "真实桌面 WebView 使用本地模式",
+      "passed": true
+    },
+    {
+      "name": "数据目录为本次独立验收目录",
+      "passed": true
+    },
+    {
+      "name": "首次启动没有填入演示记录",
+      "passed": true
+    },
+    {
+      "name": "设置 IPC 已持久化",
+      "passed": true
+    },
+    {
+      "name": "排除应用去重并保留原始名称",
+      "passed": true
+    },
+    {
+      "name": "集合 IPC 已持久化",
+      "passed": true
+    },
+    {
+      "name": "不存在的记录返回错误",
+      "passed": true
+    },
+    {
+      "name": "非法保留策略被拒绝",
+      "passed": true
+    },
+    {
+      "name": "非法排除应用名被拒绝",
+      "passed": true
+    },
+    {
+      "name": "图片缩略图命令拒绝不存在的记录",
+      "passed": true
+    },
+    {
+      "name": "重启保留暂停状态",
+      "passed": true
+    },
+    {
+      "name": "重启保留集合和设置",
+      "passed": true
+    },
+    {
+      "name": "重启保留排除应用",
+      "passed": true
+    },
+    {
+      "name": "验收期间未写入任何记录",
+      "passed": true
+    }
+  ],
+  "clipboardReadOrWriteByTest": false,
+  "note": "真实桌面IPC与重启验收；不覆盖用户剪贴板，不替代系统采集/粘贴的人工验收。"
+}
