@@ -128,8 +128,8 @@ fn lock(state: &AppState) -> Result<MutexGuard<'_, Inner>> {
         .map_err(|_| "Native coordinator lock is poisoned".into())
 }
 fn allowed(window: &tauri::WebviewWindow) -> Result<()> {
-    if window.label() != "main" {
-        Err("This command is restricted to main".into())
+    if !matches!(window.label(), "main" | "quick") {
+        Err("This command is restricted to MyPaste windows".into())
     } else {
         Ok(())
     }
@@ -524,18 +524,80 @@ fn hide_quick_window(
     }
     window
         .hide()
-        .map_err(|e| format!("Cannot hide main window: {e}"))
+        .map_err(|e| format!("Cannot hide quick window: {e}"))
 }
 
+fn quick_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow> {
+    if let Some(window) = app.get_webview_window("quick") {
+        return Ok(window);
+    }
+    let window = tauri::WebviewWindowBuilder::new(
+        app,
+        "quick",
+        tauri::WebviewUrl::App("index.html#quick".into()),
+    )
+    .title("MyPaste 快捷窗口")
+    .inner_size(640.0, 610.0)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .center()
+    .visible(false)
+    .on_navigation(trusted_url)
+    .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+    .build()
+    .map_err(|e| format!("Cannot create quick window: {e}"))?;
+    let handle = window.clone();
+    window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Focused(false) => {
+            if handle.is_visible().unwrap_or(false) {
+                let _ = handle.hide();
+                if let Some(state) = handle.try_state::<AppState>() {
+                    if let Ok(mut session) = state.quick.lock() {
+                        session.invalidate();
+                    }
+                }
+            }
+        }
+        tauri::WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            let _ = handle.hide();
+        }
+        _ => {}
+    });
+    Ok(window)
+}
+fn open_quick(app: &tauri::AppHandle) -> Result<()> {
+    let window = quick_window(app)?;
+    let state = app.state::<AppState>();
+    let already_open = window.is_visible().unwrap_or(false) && window.is_focused().unwrap_or(false);
+    if !already_open {
+        let (target, pid) = platform::foreground();
+        state
+            .quick
+            .lock()
+            .map_err(|_| "Quick session lock is poisoned".to_string())?
+            .open(target, pid);
+    }
+    app.emit_to("quick", "desktop://quick-open", ())
+        .map_err(|e| format!("Quick-open event failed: {e}"))?;
+    window.unminimize().map_err(|e| e.to_string())?;
+    window.show().map_err(|e| e.to_string())?;
+    window.set_focus().map_err(|e| e.to_string())?;
+    Ok(())
+}
 fn reveal(app: &tauri::AppHandle, quick: bool) -> Result<()> {
     let state = app.state::<AppState>();
     if quick {
-        let (target, pid) = platform::foreground();
-        let mut session = state
-            .quick
-            .lock()
-            .map_err(|_| "Quick session lock is poisoned".to_string())?;
-        session.open(target, pid);
+        match open_quick(app) {
+            Ok(()) => return Ok(()),
+            Err(error) => eprintln!("Quick window unavailable, falling back to main: {error}"),
+        }
+        if let Ok(mut session) = state.quick.lock() {
+            let (target, pid) = platform::foreground();
+            session.open(target, pid);
+        }
     } else if let Ok(mut session) = state.quick.lock() {
         // Opening the full window means the old quick target is no longer the foreground app.
         session.invalidate();

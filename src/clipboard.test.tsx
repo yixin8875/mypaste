@@ -173,3 +173,17 @@ describe('编辑草稿', () => {
     await act(async () => { saved.resolve(true); await settle() }); expect(document.activeElement).toBe(input); expect(input.value).toBe('B')
   })
 })
+describe('独立快捷窗口', () => {
+  afterEach(() => { window.location.hash = '' })
+  it('#quick 只渲染快捷面板，复制后隐藏窗口', async () => {
+    window.location.hash = '#quick'
+    await render(<App/>)
+    expect(host.querySelector('.app-shell')?.className).toContain('quick-only')
+    expect(host.querySelector('[role="dialog"][aria-label="快捷窗口"]')).toBeTruthy()
+    expect(api.snapshot).toHaveBeenCalled()
+    await clickText('.quick-row', '测试记录')
+    expect(api.copy).toHaveBeenCalledWith(1)
+    expect(api.hideQuick).toHaveBeenCalled()
+    expect(host.querySelector('[role="dialog"][aria-label="快捷窗口"]')).toBeNull()
+  })
+})

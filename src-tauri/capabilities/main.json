@@ -1,9 +1,9 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "Local main window may use only MyPaste commands and subscribe to events.",
+  "description": "Local MyPaste windows may use only MyPaste commands and subscribe to events.",
   "local": true,
-  "windows": ["main"],
+  "windows": ["main", "quick"],
   "permissions": [
     "core:event:allow-listen", "core:event:allow-unlisten",
     "allow-get-snapshot", "allow-get-item", "allow-search-items", "allow-update-item",
