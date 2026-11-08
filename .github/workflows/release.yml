@@ -37,4 +37,4 @@ jobs:
           releaseBody: 见 CHANGELOG.md。Windows 安装包与自动更新清单均已签名。
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: true
+          uploadUpdaterJson: true
