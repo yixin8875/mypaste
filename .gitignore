@@ -1,0 +1,14 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+.native-smoke-*/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+!.env.example
+# Updater signing keys must never enter the repository.
+*.key
+*.pem
+.tauri/

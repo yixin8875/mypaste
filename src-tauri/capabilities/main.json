@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Local main window may use only MyPaste commands and subscribe to events.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen", "core:event:allow-unlisten",
+    "allow-get-snapshot", "allow-get-item", "allow-search-items", "allow-update-item",
+    "allow-purge-item", "allow-create-collection", "allow-update-settings",
+    "allow-copy-item", "allow-get-image", "allow-get-thumbnail", "allow-paste-item", "allow-open-link",
+    "allow-hide-quick-window",
+    "updater:default", "process:allow-restart"
+  ]
+}
