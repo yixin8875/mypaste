@@ -268,15 +268,73 @@ mod win {
         if exclude != 0 && unsafe { IsClipboardFormatAvailable(exclude) } != 0 {
             return Ok(None);
         }
+        let mut drop_paths: Vec<String> = Vec::new();
         if unsafe { IsClipboardFormatAvailable(15) } != 0 {
             let data = read_global(15, MAX_FILE_LIST + 64 * 1024)?;
-            let paths = decode_dropfiles(&data)?;
-            if !paths.is_empty() {
-                return Capture::files(paths.into_iter().map(file_entry).collect()).map(Some);
-            }
+            drop_paths = decode_dropfiles(&data)?;
         }
         let png_format = format("PNG");
-        if png_format != 0 && unsafe { IsClipboardFormatAvailable(png_format) } != 0 {
+        let png_available =
+            png_format != 0 && unsafe { IsClipboardFormatAvailable(png_format) } != 0;
+        let dib_available = [17, 8]
+            .iter()
+            .any(|dib| unsafe { IsClipboardFormatAvailable(*dib) } != 0);
+        let image_available = png_available || dib_available;
+        if !drop_paths.is_empty() && !prefers_image(image_available, &drop_paths) {
+            return Capture::files(drop_paths.into_iter().map(file_entry).collect()).map(Some);
+        }
+        if image_available {
+            match read_image_clipboard(png_format, png_available, dib_available) {
+                Ok(capture) => return Ok(Some(capture)),
+                // A transient file list is still usable when the image data is malformed.
+                Err(_) if !drop_paths.is_empty() => {
+                    return Capture::files(drop_paths.into_iter().map(file_entry).collect())
+                        .map(Some);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !drop_paths.is_empty() {
+            return Capture::files(drop_paths.into_iter().map(file_entry).collect()).map(Some);
+        }
+        if unsafe { IsClipboardFormatAvailable(13) } != 0 {
+            let data = read_global(13, 2 * 1024 * 1024 + 2)?;
+            let utf16: Vec<u16> = data
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .take_while(|u| *u != 0)
+                .collect();
+            let text = String::from_utf16(&utf16).map_err(|_| "Invalid Unicode clipboard text")?;
+            if text.is_empty() {
+                return Ok(None);
+            }
+            return Capture::text(text).map(Some);
+        }
+        Ok(None)
+    }
+    /// Browser and IM "copy image" often expose both a bitmap and a file list that
+    /// points at a transient render in a temp folder. The bitmap is the real copy;
+    /// a file list is only preferred when it points at persistent user files.
+    pub(super) fn transient_drop(path: &str) -> bool {
+        let normalized = path.replace('/', "\\").to_ascii_lowercase();
+        [
+            "\\temp\\",
+            "\\tmp\\",
+            "\\inetcache\\",
+            "\\temporary internet files\\",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    }
+    pub(super) fn prefers_image(has_image: bool, paths: &[String]) -> bool {
+        has_image && (paths.is_empty() || paths.iter().all(|path| transient_drop(path)))
+    }
+    fn read_image_clipboard(
+        png_format: u32,
+        png_available: bool,
+        dib_available: bool,
+    ) -> Result<Capture> {
+        if png_available {
             let bytes = read_global(png_format, MAX_IMAGE)?;
             let reader =
                 image::ImageReader::with_format(Cursor::new(&bytes), image::ImageFormat::Png);
@@ -297,27 +355,16 @@ mod win {
                 .decode()
                 .map_err(|e| format!("Clipboard PNG decode failed: {e}"))?
                 .to_rgba8();
-            return Capture::rgba(w as usize, h as usize, decoded.as_raw()).map(Some);
+            return Capture::rgba(w as usize, h as usize, decoded.as_raw());
         }
-        for dib in [17, 8] {
-            if unsafe { IsClipboardFormatAvailable(dib) } != 0 {
-                return decode_dib(&read_global(dib, 85_000_000)?).map(Some);
+        if dib_available {
+            for dib in [17, 8] {
+                if unsafe { IsClipboardFormatAvailable(dib) } != 0 {
+                    return decode_dib(&read_global(dib, 85_000_000)?);
+                }
             }
         }
-        if unsafe { IsClipboardFormatAvailable(13) } != 0 {
-            let data = read_global(13, 2 * 1024 * 1024 + 2)?;
-            let utf16: Vec<u16> = data
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                .take_while(|u| *u != 0)
-                .collect();
-            let text = String::from_utf16(&utf16).map_err(|_| "Invalid Unicode clipboard text")?;
-            if text.is_empty() {
-                return Ok(None);
-            }
-            return Capture::text(text).map(Some);
-        }
-        Ok(None)
+        Err("Clipboard image format is unavailable".into())
     }
     fn u32_at(data: &[u8], at: usize) -> Result<u32> {
         let bytes = data.get(at..at + 4).ok_or("Truncated DIB header")?;
@@ -777,5 +824,26 @@ mod tests {
         dib[4..8].copy_from_slice(&i32::MAX.to_le_bytes());
         assert!(win::decode_dib(&dib).is_err());
         assert!(win::decode_dib(&[0; 4]).is_err());
+    }
+    #[test]
+    fn transient_drop_lists_prefer_bitmap_copies() {
+        assert!(win::transient_drop(
+            "C:\\Users\\synthetic\\AppData\\Local\\Temp\\render.png"
+        ));
+        assert!(win::transient_drop(
+            "C:\\Users\\synthetic\\Documents\\WeChat Files\\wxid\\FileStorage\\Temp\\2026-11\\a.png"
+        ));
+        assert!(win::transient_drop(
+            "C:/Users/synthetic/AppData/Local/Microsoft/Windows/INetCache/IE/abc[1].png"
+        ));
+        assert!(!win::transient_drop(
+            "C:\\Users\\synthetic\\Pictures\\photo.png"
+        ));
+        let temp = vec!["C:\\Users\\synthetic\\AppData\\Local\\Temp\\a.png".to_string()];
+        let real = vec!["C:\\Users\\synthetic\\Pictures\\photo.png".to_string()];
+        assert!(win::prefers_image(true, &temp));
+        assert!(!win::prefers_image(true, &real));
+        assert!(!win::prefers_image(false, &temp));
+        assert!(win::prefers_image(true, &[]));
     }
 }
