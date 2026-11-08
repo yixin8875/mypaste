@@ -316,7 +316,7 @@ fn copy_native(state: &AppState, id: i64) -> Result<u32> {
         return Err("Restore this item before copying".into());
     }
     let png = if item.kind == "image" {
-        Some(s.store.image(id)?)
+        Some(s.store.image(id)?.1)
     } else {
         None
     };
@@ -359,10 +359,10 @@ fn get_image(
     id: i64,
 ) -> Result<String> {
     allowed(&window)?;
-    let png = lock(&state)?.store.image(id)?;
+    let (mime, bytes) = lock(&state)?.store.image(id)?;
     Ok(format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(png)
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     ))
 }
 #[tauri::command]

@@ -53,6 +53,7 @@ let pendingUpdate: Update | null = null
 const listeners = new Set<() => void>()
 function notify() { listeners.forEach(fn => fn()) }
 function demoItem(id: number) { const item = demo.items.find(c => c.id === id); if(!item) throw new Error('记录不存在'); return item }
+function demoImageFile(item: Clip) { return item.type === 'file' && item.files.length === 1 && !item.files[0].isDir && /\.(png|jpe?g|bmp)$/i.test(item.files[0].path) }
 // Fictional inline artwork so browser previews can exercise lazy thumbnails without external files.
 function demoThumb(id: number) {
   const hue = (id * 47) % 360
@@ -109,7 +110,7 @@ export const clipboardService = {
   async image(id: number): Promise<string> { return native ? invoke('get_image', { id }) : demoThumb(id) },
   async thumbnail(id: number): Promise<string> {
     if(native) return invoke('get_thumbnail', { id })
-    return demoItem(id).type === 'image' ? demoThumb(id) : ''
+    const item = demoItem(id); return item.type === 'image' || demoImageFile(item) ? demoThumb(id) : ''
   },
   async version(): Promise<string> {
     if(!native) return '0.2.0'

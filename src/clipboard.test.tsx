@@ -51,6 +51,18 @@ describe('原生适配异步交互', () => {
     expect(host.querySelector('.primary-actions .primary-button')?.textContent).toContain('复制文件')
     await click('.primary-actions .primary-button'); expect(api.copy).toHaveBeenCalledWith(1)
   })
+  it('单个图片文件显示缩略图与预览，仍按文件复制', async () => {
+    const photo: Clip = { ...clip, type: 'file', title: 'photo.png', content: 'C:\\Synthetic\\photo.png', fileSize: 2048, fileModifiedAt: 1794090000000, files: [{ path: 'C:\\Synthetic\\photo.png', size: 2048, modifiedAt: 1794090000000, isDir: false }] }
+    data.items = [{ ...photo }]; api.item.mockResolvedValue({ ...photo })
+    api.thumbnail.mockResolvedValue('data:image/png;base64,THUMB')
+    api.image.mockResolvedValue('data:image/png;base64,FULL')
+    await render(<App/>)
+    await act(async () => { await settle() })
+    expect(api.thumbnail).toHaveBeenCalledWith(1)
+    expect(host.querySelector('.clip-thumb img')?.getAttribute('src')).toBe('data:image/png;base64,THUMB')
+    expect(host.querySelector('.file-preview .native-image-preview img')?.getAttribute('src')).toBe('data:image/png;base64,FULL')
+    await click('.primary-actions .primary-button'); expect(api.copy).toHaveBeenCalledWith(1)
+  })
   it('原生快照失败不回退为虚构记录', async () => {
     api.snapshot.mockRejectedValue(new Error('数据库不可读')); await render(<App/>)
     expect(host.querySelectorAll('.clip-row')).toHaveLength(0); expect(host.querySelector('[role="alert"]')?.textContent).toContain('数据库不可读')

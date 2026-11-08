@@ -180,6 +180,77 @@ fn thumbnail(pixels: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
         .ok()?;
     (png.len() <= MAX_THUMB).then_some(png)
 }
+fn encode_rgba_png(pixels: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    use image::ImageEncoder;
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(pixels, width, height, image::ExtendedColorType::Rgba8)
+        .ok()?;
+    (png.len() <= MAX_THUMB).then_some(png)
+}
+/// A file record that holds exactly one supported image file can be previewed.
+fn image_file_path(content: &str, meta: &str) -> Option<String> {
+    let mut entries: Vec<FileEntry> = serde_json::from_str(meta).ok().unwrap_or_default();
+    if entries.is_empty() && !content.is_empty() && !content.contains(['\n', '\r']) {
+        entries.push(FileEntry {
+            path: content.to_string(),
+            size: None,
+            modified_at: None,
+            is_dir: false,
+        });
+    }
+    if entries.len() != 1 || entries[0].is_dir {
+        return None;
+    }
+    let path = entries[0].path.clone();
+    let extension = Path::new(&path)
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "bmp").then_some(path)
+}
+fn read_image_file(path: &str) -> Result<(image::ImageFormat, Vec<u8>)> {
+    let meta = std::fs::metadata(path).map_err(|_| "Image file is unavailable".to_string())?;
+    if !meta.is_file() {
+        return Err("Image path is not a file".into());
+    }
+    if meta.len() > MAX_IMAGE as u64 {
+        return Err("Image file exceeds the 10 MiB limit".into());
+    }
+    let bytes = std::fs::read(path).map_err(|_| "Image file read failed".to_string())?;
+    let format = image::guess_format(&bytes).map_err(|_| "Unsupported image file".to_string())?;
+    if !matches!(
+        format,
+        image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::Bmp
+    ) {
+        return Err("Unsupported image file".into());
+    }
+    Ok((format, bytes))
+}
+fn decode_image_file(bytes: &[u8]) -> Result<image::RgbaImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("Image file decode failed: {e}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(80_000_000);
+    limits.max_image_width = Some(MAX_PIXELS as u32);
+    limits.max_image_height = Some(MAX_PIXELS as u32);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|e| format!("Image file decode failed: {e}"))?;
+    if decoded.width() as u64 * decoded.height() as u64 > MAX_PIXELS as u64 {
+        return Err("Image file exceeds 20 million pixels".into());
+    }
+    Ok(decoded.to_rgba8())
+}
+fn mime_for(format: image::ImageFormat) -> &'static str {
+    match format {
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Bmp => "image/bmp",
+        _ => "image/png",
+    }
+}
 pub fn digest(kind: &str, bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(b"mypaste:v1\0");
@@ -715,17 +786,35 @@ impl Store {
             .map_err(db)?;
         Ok(())
     }
-    pub fn image(&self, id: i64) -> Result<Vec<u8>> {
+    pub fn image(&self, id: i64) -> Result<(String, Vec<u8>)> {
         valid_id(id)?;
-        self.conn
+        let (kind, png, content, meta): (String, Option<Vec<u8>>, String, String) = self
+            .conn
             .query_row(
-                "SELECT png FROM items WHERE id=?1 AND kind='image'",
+                "SELECT kind,png,content,meta FROM items WHERE id=?1",
                 [id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .map_err(db)?
-            .ok_or("Image not found".into())
+            .ok_or("Image not found")?;
+        if kind == "image" {
+            return Ok(("image/png".into(), png.ok_or("Image not found")?));
+        }
+        if kind != "file" {
+            return Err("Image not found".into());
+        }
+        let path = image_file_path(&content, &meta).ok_or("Image file not found")?;
+        let (format, bytes) = read_image_file(&path)?;
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .map_err(|e| format!("Image file decode failed: {e}"))?
+            .into_dimensions()
+            .map_err(|e| format!("Image file decode failed: {e}"))?;
+        if width as u64 * height as u64 > MAX_PIXELS as u64 {
+            return Err("Image file exceeds 20 million pixels".into());
+        }
+        Ok((mime_for(format).to_string(), bytes))
     }
     pub fn hash(&self, id: i64) -> Result<String> {
         valid_id(id)?;
@@ -733,32 +822,51 @@ impl Store {
             .query_row("SELECT hash FROM items WHERE id=?1", [id], |r| r.get(0))
             .map_err(db)
     }
-    /// Return a small preview, generating and caching it for images captured before v4.
+    /// Return a small preview for an image record or a single image file, caching it.
     pub fn thumbnail(&mut self, id: i64) -> Result<Vec<u8>> {
         valid_id(id)?;
-        let (stored, png): (Option<Vec<u8>>, Vec<u8>) = self
+        let (kind, stored, png, content, meta): (
+            String,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            String,
+            String,
+        ) = self
             .conn
             .query_row(
-                "SELECT thumb,png FROM items WHERE id=?1 AND kind='image'",
+                "SELECT kind,thumb,png,content,meta FROM items WHERE id=?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()
             .map_err(db)?
-            .ok_or("Image not found")?;
+            .ok_or("Item not found")?;
         if let Some(thumb) = stored {
             if !thumb.is_empty() {
                 return Ok(thumb);
             }
         }
-        let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
-            .map_err(|e| format!("Stored image decode failed: {e}"))?
-            .to_rgba8();
-        let (width, height) = image.dimensions();
-        if width as u64 * height as u64 > MAX_PIXELS as u64 {
-            return Err("Stored image exceeds the pixel limit".into());
-        }
-        let thumb = thumbnail(image.as_raw(), width, height).unwrap_or(png);
+        let thumb = if kind == "image" {
+            let png = png.ok_or("Image not found")?;
+            let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                .map_err(|e| format!("Stored image decode failed: {e}"))?
+                .to_rgba8();
+            let (width, height) = image.dimensions();
+            if width as u64 * height as u64 > MAX_PIXELS as u64 {
+                return Err("Stored image exceeds the pixel limit".into());
+            }
+            thumbnail(image.as_raw(), width, height).unwrap_or(png)
+        } else if kind == "file" {
+            let path = image_file_path(&content, &meta).ok_or("Image file not found")?;
+            let (_, bytes) = read_image_file(&path)?;
+            let image = decode_image_file(&bytes)?;
+            let (width, height) = image.dimensions();
+            thumbnail(image.as_raw(), width, height)
+                .or_else(|| encode_rgba_png(image.as_raw(), width, height))
+                .ok_or("Image file thumbnail failed")?
+        } else {
+            return Err("Image not found".into());
+        };
         self.conn
             .execute("UPDATE items SET thumb=?1 WHERE id=?2", params![&thumb, id])
             .map_err(db)?;
@@ -972,6 +1080,64 @@ mod tests {
         assert_eq!(cached.as_deref(), Some(thumb.as_slice()));
         assert_eq!(store.get(id).unwrap().source, "screenshot");
     }
+    #[test]
+    fn image_file_records_get_thumbnails_and_previews() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic-preview.png");
+        image::RgbaImage::from_pixel(640, 480, image::Rgba([10, 20, 30, 255]))
+            .save(&path)
+            .unwrap();
+        let capture = Capture::files(vec![FileEntry {
+            path: path.to_string_lossy().into_owned(),
+            size: Some(123),
+            modified_at: None,
+            is_dir: false,
+        }])
+        .unwrap();
+        let mut store = memory();
+        let id = store.capture(&capture, now()).unwrap();
+        let (mime, bytes) = store.image(id).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, std::fs::read(&path).unwrap());
+        let thumb = store.thumbnail(id).unwrap();
+        assert!(thumb.starts_with(b"\x89PNG"));
+        assert!(thumb.len() <= MAX_THUMB);
+        let cached: Option<Vec<u8>> = store
+            .conn
+            .query_row("SELECT thumb FROM items WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached.as_deref(), Some(thumb.as_slice()));
+
+        let jpg_path = dir.path().join("synthetic-preview.jpg");
+        image::RgbImage::from_pixel(64, 48, image::Rgb([200, 100, 50]))
+            .save(&jpg_path)
+            .unwrap();
+        let jpg = Capture::files(vec![FileEntry {
+            path: jpg_path.to_string_lossy().into_owned(),
+            size: Some(456),
+            modified_at: None,
+            is_dir: false,
+        }])
+        .unwrap();
+        let jpg_id = store.capture(&jpg, now()).unwrap();
+        let (mime, bytes) = store.image(jpg_id).unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(bytes, std::fs::read(&jpg_path).unwrap());
+        assert!(store.thumbnail(jpg_id).unwrap().starts_with(b"\x89PNG"));
+
+        let text_path = dir.path().join("synthetic-note.txt");
+        std::fs::write(&text_path, b"synthetic").unwrap();
+        let plain = Capture::files(vec![FileEntry {
+            path: text_path.to_string_lossy().into_owned(),
+            size: Some(9),
+            modified_at: None,
+            is_dir: false,
+        }])
+        .unwrap();
+        let plain_id = store.capture(&plain, now()).unwrap();
+        assert!(store.image(plain_id).is_err());
+        assert!(store.thumbnail(plain_id).is_err());
+    }
     fn text(s: &str) -> Capture {
         Capture::text(s.into()).unwrap()
     }
@@ -1176,7 +1342,7 @@ mod tests {
         assert!(Capture::rgba(1, 1, &[0]).is_err());
         let id = s.capture(&a, now()).unwrap();
         assert!(s.list().unwrap()[0].content.is_empty());
-        assert!(s.image(id).unwrap().starts_with(b"\x89PNG"));
+        assert!(s.image(id).unwrap().1.starts_with(b"\x89PNG"));
         assert_eq!(s.capture(&b, now()).unwrap(), id);
         // Synthetic zero blobs exercise aggregate quota without reading a clipboard.
         s.conn
