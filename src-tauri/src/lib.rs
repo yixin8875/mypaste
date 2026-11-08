@@ -113,10 +113,19 @@ impl QuickSession {
         self.open(0, 0);
     }
 }
+/// Tracks the lazily created quick webview. The window stays hidden until its
+/// page has finished loading, so the first shortcut never shows a blank webview.
+#[derive(Default)]
+struct QuickUi {
+    loaded: bool,
+    pending: bool,
+    shown_at: Option<Instant>,
+}
 struct AppState {
     inner: Arc<Mutex<Inner>>,
     data_dir: String,
     quick: Arc<Mutex<QuickSession>>,
+    quick_ui: Mutex<QuickUi>,
     stop: Arc<AtomicBool>,
     listener_thread: AtomicU32,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -546,19 +555,30 @@ fn quick_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow> {
     .visible(false)
     .on_navigation(trusted_url)
     .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+    .on_page_load(|window, payload| {
+        if payload.event() == tauri::webview::PageLoadEvent::Finished {
+            quick_window_ready(&window);
+        }
+    })
     .build()
     .map_err(|e| format!("Cannot create quick window: {e}"))?;
     let handle = window.clone();
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Focused(false) => {
-            if handle.is_visible().unwrap_or(false) {
-                let _ = handle.hide();
-                if let Some(state) = handle.try_state::<AppState>() {
-                    if let Ok(mut session) = state.quick.lock() {
-                        session.invalidate();
-                    }
+            if !handle.is_visible().unwrap_or(false) {
+                return;
+            }
+            if let Some(state) = handle.try_state::<AppState>() {
+                // Creating the webview briefly disturbs activation; never let
+                // that spurious blur hide the window right after it opened.
+                if quick_focus_grace(&state) {
+                    return;
+                }
+                if let Ok(mut session) = state.quick.lock() {
+                    session.invalidate();
                 }
             }
+            let _ = handle.hide();
         }
         tauri::WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
@@ -567,6 +587,41 @@ fn quick_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow> {
         _ => {}
     });
     Ok(window)
+}
+fn quick_focus_grace(state: &AppState) -> bool {
+    state
+        .quick_ui
+        .lock()
+        .ok()
+        .and_then(|ui| ui.shown_at)
+        .is_some_and(|at| at.elapsed() < Duration::from_millis(600))
+}
+fn show_quick_window(window: &tauri::WebviewWindow, state: &AppState) -> Result<()> {
+    if let Ok(mut ui) = state.quick_ui.lock() {
+        ui.shown_at = Some(Instant::now());
+    }
+    window.unminimize().map_err(|e| e.to_string())?;
+    window.show().map_err(|e| e.to_string())?;
+    window.set_focus().map_err(|e| e.to_string())?;
+    Ok(())
+}
+fn quick_window_ready(window: &tauri::WebviewWindow) {
+    let Some(state) = window.try_state::<AppState>() else {
+        return;
+    };
+    let pending = state
+        .quick_ui
+        .lock()
+        .map(|mut ui| {
+            ui.loaded = true;
+            std::mem::take(&mut ui.pending)
+        })
+        .unwrap_or(false);
+    if pending {
+        if let Err(error) = show_quick_window(window, &state) {
+            eprintln!("Cannot reveal loaded quick window: {error}");
+        }
+    }
 }
 fn open_quick(app: &tauri::AppHandle) -> Result<()> {
     let window = quick_window(app)?;
@@ -580,12 +635,24 @@ fn open_quick(app: &tauri::AppHandle) -> Result<()> {
             .map_err(|_| "Quick session lock is poisoned".to_string())?
             .open(target, pid);
     }
+    let loaded = state
+        .quick_ui
+        .lock()
+        .map(|mut ui| {
+            if !ui.loaded {
+                ui.pending = true;
+            }
+            ui.loaded
+        })
+        .map_err(|_| "Quick window state lock is poisoned".to_string())?;
+    if !loaded {
+        // The initial render already opens the panel; showing now would expose
+        // the blank webview, so wait for PageLoadEvent::Finished.
+        return Ok(());
+    }
     app.emit_to("quick", "desktop://quick-open", ())
         .map_err(|e| format!("Quick-open event failed: {e}"))?;
-    window.unminimize().map_err(|e| e.to_string())?;
-    window.show().map_err(|e| e.to_string())?;
-    window.set_focus().map_err(|e| e.to_string())?;
-    Ok(())
+    show_quick_window(&window, &state)
 }
 fn reveal(app: &tauri::AppHandle, quick: bool) -> Result<()> {
     let state = app.state::<AppState>();
@@ -810,6 +877,7 @@ fn setup(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Er
         })),
         data_dir: dir.to_string_lossy().into_owned(),
         quick: Arc::new(Mutex::new(QuickSession::default())),
+        quick_ui: Mutex::new(QuickUi::default()),
         stop: Arc::new(AtomicBool::new(false)),
         listener_thread: AtomicU32::new(0),
         workers: Mutex::new(vec![]),
