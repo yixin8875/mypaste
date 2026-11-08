@@ -9,7 +9,7 @@ import App, { Editable } from './App'
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 let root: Root, host: HTMLDivElement, quickOpen: () => void, changed: () => void, data: Snapshot
 const fullText = '完整正文'.repeat(80) + '关键词在摘要之外'
-const clip: Clip = { id: 1, title: '测试记录', content: fullText, type: 'text', source: '测试应用', time: '10:00', day: '今天', capturedAt: 1794090000000, deletedAt: null, deleted: false, favorite: false, collections: [], note: '', fileSize: 0, fileModifiedAt: null, files: [], lastUsedAt: null, useCount: 0 }
+const clip: Clip = { id: 1, title: '测试记录', content: fullText, type: 'text', source: '测试应用', time: '10:00', day: '今天', capturedAt: 1794090000000, deletedAt: null, deleted: false, favorite: false, pinned: false, collections: [], note: '', fileSize: 0, fileModifiedAt: null, files: [], lastUsedAt: null, useCount: 0 }
 const settle = async () => { for(let i = 0; i < 8; i++) await Promise.resolve() }
 const render = async (node: React.ReactNode) => { await act(async () => { root.render(node); await settle() }) }
 const click = async (selector: string) => { await act(async () => { host.querySelector<HTMLButtonElement>(selector)!.click(); await settle() }) }
@@ -23,7 +23,7 @@ const openQuick = async () => { await act(async () => { quickOpen(); await settl
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r }); return { promise, resolve } }
 beforeEach(() => {
   vi.resetAllMocks()
-  data = { items: [{ ...clip, content: fullText.slice(0, 240) }], collections: [], settings: { paused: false, retentionDays: 30, maxItems: 500, shortcut: 'Ctrl+Shift+V', excludedApps: [] }, status: { captureState: 'running', captureError: null, shortcutRegistered: true, shortcutError: null }, dataDir: 'C:/synthetic-test-data' }
+  data = { items: [{ ...clip, content: fullText.slice(0, 240) }], collections: [], settings: { paused: false, retentionDays: 30, maxItems: 500, shortcut: 'Ctrl+Shift+V', excludedApps: [] }, status: { captureState: 'running', captureError: null, shortcutRegistered: true, shortcutError: null }, dataDir: 'C:/synthetic-test-data', storageError: null }
   api.snapshot.mockImplementation(async () => structuredClone(data)); api.item.mockImplementation(async () => ({ ...clip })); api.search.mockResolvedValue([1])
   api.subscribe.mockImplementation(async (change, quick) => { changed = change; quickOpen = quick; return vi.fn() })
   api.update.mockResolvedValue(undefined); api.copy.mockResolvedValue(undefined); api.image.mockResolvedValue(''); api.thumbnail.mockResolvedValue(''); api.hideQuick.mockResolvedValue(undefined); api.settings.mockResolvedValue(undefined)
@@ -145,6 +145,14 @@ describe('原生适配异步交互', () => {
     expect(host.querySelector('.quick-modal')).not.toBeNull()
     expect(host.querySelector('.quick-notice')?.textContent).toContain('已复制，请在目标应用按 Ctrl+V')
     expect(api.hideQuick).not.toHaveBeenCalled()
+  })
+  it('置顶记录在快捷窗口排在最前', async () => {
+    const pinned: Clip = { ...clip, id: 8, title: '置顶片段', pinned: true, capturedAt: 1700000000000 }
+    const recent: Clip = { ...clip, id: 9, title: '最新记录', capturedAt: 1794090000000 }
+    data.items = [{ ...recent }, { ...pinned }]
+    api.item.mockImplementation(async (id: number) => data.items.find(c => c.id === id)!)
+    await render(<App/>); await openQuick()
+    expect(host.querySelector('.quick-row strong')?.textContent).toBe('置顶片段')
   })
   it('设置页检查并安装更新', async () => {
     api.checkUpdate.mockResolvedValue({ version: '0.3.0', currentVersion: '0.2.0', notes: '修复与改进', date: null })

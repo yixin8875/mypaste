@@ -12,6 +12,10 @@ const COMMANDS: &[&str] = &[
     "paste_item",
     "open_link",
     "hide_quick_window",
+    "export_backup",
+    "import_backup",
+    "open_data_dir",
+    "set_data_dir",
 ];
 fn main() {
     tauri_build::try_build(

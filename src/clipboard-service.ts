@@ -7,14 +7,14 @@ export type FileEntry = { path: string; size: number | null; modifiedAt: number 
 export type Clip = {
   id: number; title: string; content: string; type: Kind; source: string
   time: string; day: string; capturedAt: number; deletedAt: number | null
-  favorite: boolean; collections: string[]; note: string; deleted: boolean
+  favorite: boolean; pinned: boolean; collections: string[]; note: string; deleted: boolean
   fileSize: number; fileModifiedAt: number | null; files: FileEntry[]
   lastUsedAt: number | null; useCount: number
 }
 export type Settings = { paused: boolean; retentionDays: number; maxItems: number; shortcut: string; excludedApps: string[] }
 export type RuntimeStatus = { captureState: 'running' | 'paused' | 'error'; captureError: string | null; shortcutRegistered: boolean; shortcutError: string | null }
-export type Snapshot = { items: Clip[]; collections: string[]; settings: Settings; status: RuntimeStatus; dataDir: string }
-export type ClipPatch = Partial<Pick<Clip, 'title' | 'note' | 'favorite' | 'collections' | 'deleted'>>
+export type Snapshot = { items: Clip[]; collections: string[]; settings: Settings; status: RuntimeStatus; dataDir: string; storageError: string | null }
+export type ClipPatch = Partial<Pick<Clip, 'title' | 'note' | 'favorite' | 'pinned' | 'collections' | 'deleted'>>
 export type PasteOutcome = { copied: boolean; status: 'input_sent' | 'manual_required' | 'clipboard_failed'; reason: string | null }
 export type UpdateCheck = { version: string; currentVersion: string; notes: string; date: string | null }
 export type UpdateProgress = { downloaded: number; total: number | null }
@@ -43,11 +43,11 @@ const demo: Snapshot = {
     const fileSize = files.reduce((sum, entry) => sum + (entry.size ?? 0), 0)
     const fileModifiedAt = files.reduce<number | null>((latest, entry) => entry.modifiedAt !== null && (latest === null || entry.modifiedAt > latest) ? entry.modifiedAt : latest, null)
     const useCount = [11, 4, 1, 7, 2, 3, 1, 5, 0, 1, 2][i] ?? 0
-    return { id: i + 1, title, content, type, source, favorite, collections: collection ? [collection] : [], note: '', capturedAt, day: i < 6 ? '今天' : '昨天', time: new Date(capturedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }), deleted: i === 9, deletedAt: i === 9 ? now : null, fileSize, fileModifiedAt, files, lastUsedAt: useCount ? capturedAt + 60000 : null, useCount }
+    return { id: i + 1, title, content, type, source, favorite, pinned: i === 0 || i === 6, collections: collection ? [collection] : [], note: '', capturedAt, day: i < 6 ? '今天' : '昨天', time: new Date(capturedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }), deleted: i === 9, deletedAt: i === 9 ? now : null, fileSize, fileModifiedAt, files, lastUsedAt: useCount ? capturedAt + 60000 : null, useCount }
   }),
   collections: ['日常工作', '开发片段', '灵感收集'],
   settings: { paused: false, retentionDays: 30, maxItems: 500, shortcut: 'Ctrl+Shift+V', excludedApps: [] },
-  status: { captureState: 'running', captureError: null, shortcutRegistered: false, shortcutError: null }, dataDir: '',
+  status: { captureState: 'running', captureError: null, shortcutRegistered: false, shortcutError: null }, dataDir: '', storageError: null,
 }
 let pendingUpdate: Update | null = null
 const listeners = new Set<() => void>()
@@ -82,6 +82,37 @@ export const clipboardService = {
     if(native) return invoke('purge_item', { id })
     if(!demoItem(id).deleted) throw new Error('只能彻底删除回收站中的记录')
     demo.items = demo.items.filter(c => c.id !== id); notify()
+  },
+  async exportBackup(): Promise<string | null> {
+    if(!native) throw new Error('浏览器演示不支持导出备份')
+    const { save } = await import('@tauri-apps/plugin-dialog')
+    const path = await save({ title: '导出 MyPaste 备份', defaultPath: `MyPaste-backup-${new Date().toISOString().slice(0, 10)}.sqlite3`, filters: [{ name: 'MyPaste 备份', extensions: ['sqlite3'] }] })
+    if(!path) return null
+    await invoke('export_backup', { path })
+    return path
+  },
+  async pickBackup(): Promise<string | null> {
+    if(!native) throw new Error('浏览器演示不支持导入备份')
+    const { open } = await import('@tauri-apps/plugin-dialog')
+    const path = await open({ title: '选择 MyPaste 备份', multiple: false, directory: false, filters: [{ name: 'MyPaste 备份', extensions: ['sqlite3'] }] })
+    return typeof path === 'string' ? path : null
+  },
+  async importBackup(path: string): Promise<void> {
+    if(native) return invoke('import_backup', { path })
+    throw new Error('浏览器演示不支持导入备份')
+  },
+  async openDataDir(): Promise<void> {
+    if(native) await invoke('open_data_dir')
+  },
+  async chooseDataDir(): Promise<string | null> {
+    if(!native) throw new Error('浏览器演示不支持修改存储路径')
+    const { open } = await import('@tauri-apps/plugin-dialog')
+    const path = await open({ title: '选择 MyPaste 存储目录', directory: true, multiple: false })
+    return typeof path === 'string' ? path : null
+  },
+  async setDataDir(path: string): Promise<void> {
+    if(native) return invoke('set_data_dir', { path })
+    throw new Error('浏览器演示不支持修改存储路径')
   },
   async createCollection(name: string): Promise<void> {
     if(native) return invoke('create_collection', { name })

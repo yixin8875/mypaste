@@ -15,6 +15,10 @@ mod win {
     };
     use windows_sys::Win32::{
         Foundation::*,
+        Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO,
+            MONITOR_DEFAULTTONEAREST,
+        },
         System::{DataExchange::*, LibraryLoader::GetModuleHandleW, Memory::*, Threading::*},
         UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
     };
@@ -628,6 +632,31 @@ mod win {
             }
         }
     }
+    /// Work area (physical pixels, taskbar excluded) of the monitor showing
+    /// `target`, or of the monitor under the cursor when the target is unknown.
+    pub fn work_area(target: isize) -> Option<(i32, i32, i32, i32)> {
+        unsafe {
+            let monitor = if target != 0 {
+                MonitorFromWindow(target as HWND, MONITOR_DEFAULTTONEAREST)
+            } else {
+                let mut point = POINT { x: 0, y: 0 };
+                if GetCursorPos(&mut point) == 0 {
+                    return None;
+                }
+                MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
+            };
+            if monitor.is_null() {
+                return None;
+            }
+            let mut info: MONITORINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(monitor, &mut info) == 0 {
+                return None;
+            }
+            let rect = info.rcWork;
+            Some((rect.left, rect.top, rect.right, rect.bottom))
+        }
+    }
     pub fn paste(target: isize, expected_pid: u32, expected_sequence: u32) -> Result<()> {
         let hwnd = target as HWND;
         unsafe {
@@ -711,6 +740,7 @@ mod win {
 #[cfg(windows)]
 pub use win::{
     copy, copy_files, foreground, listen, owns_clipboard, paste, read, sequence, source_app, stop,
+    work_area,
 };
 #[cfg(not(windows))]
 pub fn owns_clipboard() -> bool {
@@ -723,6 +753,10 @@ pub fn sequence() -> u32 {
 #[cfg(not(windows))]
 pub fn foreground() -> (isize, u32) {
     (0, 0)
+}
+#[cfg(not(windows))]
+pub fn work_area(_: isize) -> Option<(i32, i32, i32, i32)> {
+    None
 }
 #[cfg(not(windows))]
 pub fn source_app() -> Option<String> {

@@ -38,6 +38,7 @@ pub struct Clip {
     pub time: String,
     pub day: String,
     pub favorite: bool,
+    pub pinned: bool,
     pub collections: Vec<String>,
     pub note: String,
     pub deleted: bool,
@@ -138,6 +139,7 @@ pub struct ItemPatch {
     pub title: Option<String>,
     pub note: Option<String>,
     pub favorite: Option<bool>,
+    pub pinned: Option<bool>,
     pub collections: Option<Vec<String>>,
     pub deleted: Option<bool>,
 }
@@ -430,7 +432,7 @@ impl Store {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(db)?;
-        if version > 4 {
+        if version > 5 {
             return Err("Database schema is newer than this application".into());
         }
         if version == 0 {
@@ -490,6 +492,31 @@ impl Store {
                  ALTER TABLE items ADD COLUMN last_used INTEGER;
                  ALTER TABLE items ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0;
                  PRAGMA user_version=4;
+                 COMMIT;",
+            )
+            .map_err(db)?;
+        }
+        // v5: pinned flag plus a trigram FTS index used for substring search.
+        let current: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(db)?;
+        if current < 5 {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE items ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN(0,1));
+                 CREATE VIRTUAL TABLE items_fts USING fts5(title,content,note,content='items',content_rowid='id',tokenize='trigram');
+                 CREATE TRIGGER items_fts_insert AFTER INSERT ON items BEGIN
+                   INSERT INTO items_fts(rowid,title,content,note) VALUES(new.id,new.title,new.content,new.note);
+                 END;
+                 CREATE TRIGGER items_fts_delete AFTER DELETE ON items BEGIN
+                   INSERT INTO items_fts(items_fts,rowid,title,content,note) VALUES('delete',old.id,old.title,old.content,old.note);
+                 END;
+                 CREATE TRIGGER items_fts_update AFTER UPDATE OF title,content,note ON items BEGIN
+                   INSERT INTO items_fts(items_fts,rowid,title,content,note) VALUES('delete',old.id,old.title,old.content,old.note);
+                   INSERT INTO items_fts(rowid,title,content,note) VALUES(new.id,new.title,new.content,new.note);
+                 END;
+                 INSERT INTO items_fts(items_fts) VALUES('rebuild');
+                 PRAGMA user_version=5;
                  COMMIT;",
             )
             .map_err(db)?;
@@ -601,9 +628,9 @@ impl Store {
     fn clip(&self, id: i64, full: bool) -> Result<Clip> {
         valid_id(id)?;
         let sql = if full {
-            "SELECT id,title,content,kind,note,favorite,captured_at,deleted_at,file_size,file_modified,meta,source,last_used,use_count FROM items WHERE id=?1"
+            "SELECT id,title,content,kind,note,favorite,captured_at,deleted_at,file_size,file_modified,meta,source,last_used,use_count,pinned FROM items WHERE id=?1"
         } else {
-            "SELECT id,title,CASE WHEN kind='image' THEN '' ELSE substr(content,1,240) END,kind,note,favorite,captured_at,deleted_at,file_size,file_modified,'',source,last_used,use_count FROM items WHERE id=?1"
+            "SELECT id,title,CASE WHEN kind='image' THEN '' ELSE substr(content,1,240) END,kind,note,favorite,captured_at,deleted_at,file_size,file_modified,'',source,last_used,use_count,pinned FROM items WHERE id=?1"
         };
         let mut stored_meta = String::new();
         let mut c = self
@@ -633,6 +660,7 @@ impl Store {
                     kind: r.get(3)?,
                     note: r.get(4)?,
                     favorite: r.get(5)?,
+                    pinned: r.get(14)?,
                     captured_at: at,
                     deleted_at,
                     deleted: deleted_at.is_some(),
@@ -690,13 +718,82 @@ impl Store {
         if query.len() > 4096 {
             return Err("Search query exceeds 4096 bytes".into());
         }
-        let mut stmt = self.conn.prepare("SELECT i.id FROM items i WHERE instr(lower(i.title),lower(?1))>0 OR instr(lower(i.content),lower(?1))>0 OR instr(lower(i.note),lower(?1))>0 OR EXISTS(SELECT 1 FROM members m WHERE m.item_id=i.id AND instr(lower(m.name),lower(?1))>0) ORDER BY i.captured_at DESC,i.id DESC").map_err(db)?;
-        let result = stmt
-            .query_map([query], |r| r.get(0))
-            .map_err(db)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(db);
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        // The trigram tokenizer only indexes strings of at least three characters;
+        // shorter queries keep the literal scan so one- and two-character searches still work.
+        let result = if query.chars().count() >= 3 {
+            let phrase = format!("\"{}\"", query.replace('"', "\"\""));
+            let mut stmt = self.conn.prepare("SELECT i.id FROM items i WHERE i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?1) OR i.id IN (SELECT m.item_id FROM members m WHERE instr(lower(m.name),lower(?2))>0) ORDER BY i.captured_at DESC,i.id DESC").map_err(db)?;
+            let rows = stmt
+                .query_map(params![phrase, query], |r| r.get(0))
+                .map_err(db)?
+                .collect::<rusqlite::Result<Vec<_>>>();
+            rows.map_err(db)
+        } else {
+            let mut stmt = self.conn.prepare("SELECT i.id FROM items i WHERE instr(lower(i.title),lower(?1))>0 OR instr(lower(i.content),lower(?1))>0 OR instr(lower(i.note),lower(?1))>0 OR EXISTS(SELECT 1 FROM members m WHERE m.item_id=i.id AND instr(lower(m.name),lower(?1))>0) ORDER BY i.captured_at DESC,i.id DESC").map_err(db)?;
+            let rows = stmt
+                .query_map([query], |r| r.get(0))
+                .map_err(db)?
+                .collect::<rusqlite::Result<Vec<_>>>();
+            rows.map_err(db)
+        };
         result
+    }
+    pub fn export_to(&mut self, path: &Path) -> Result<()> {
+        let target = path.to_str().ok_or("Backup path is not valid UTF-8")?;
+        self.conn
+            .execute("VACUUM INTO ?1", [target])
+            .map_err(db)?;
+        Ok(())
+    }
+    pub fn import_from(&mut self, path: &Path) -> Result<()> {
+        let source = path.to_str().ok_or("Backup path is not valid UTF-8")?;
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS backup", [source])
+            .map_err(db)?;
+        let result = (|| -> Result<()> {
+            let version: i64 = self
+                .conn
+                .query_row("PRAGMA backup.user_version", [], |r| r.get(0))
+                .map_err(db)?;
+            if !(4..=5).contains(&version) {
+                return Err("备份文件的数据库版本不受支持".into());
+            }
+            let integrity: String = self
+                .conn
+                .query_row("PRAGMA backup.integrity_check", [], |r| r.get(0))
+                .map_err(db)?;
+            if integrity != "ok" {
+                return Err("备份文件校验失败".into());
+            }
+            let tx = self.conn.transaction().map_err(db)?;
+            tx.execute_batch("DELETE FROM members; DELETE FROM collections; DELETE FROM items;")
+                .map_err(db)?;
+            let pinned = if version >= 5 { "pinned" } else { "0" };
+            tx.execute(
+                &format!("INSERT INTO items(id,kind,hash,title,content,png,note,favorite,file_size,file_modified,meta,source,thumb,last_used,use_count,captured_at,deleted_at,pinned) SELECT id,kind,hash,title,content,png,note,favorite,file_size,file_modified,meta,source,thumb,last_used,use_count,captured_at,deleted_at,{pinned} FROM backup.items"),
+                [],
+            )
+            .map_err(db)?;
+            tx.execute(
+                "INSERT INTO collections(name) SELECT name FROM backup.collections",
+                [],
+            )
+            .map_err(db)?;
+            tx.execute(
+                "INSERT INTO members(item_id,name) SELECT item_id,name FROM backup.members",
+                [],
+            )
+            .map_err(db)?;
+            tx.commit().map_err(db)?;
+            Ok(())
+        })();
+        let detached = self.conn.execute("DETACH DATABASE backup", []);
+        result?;
+        detached.map_err(db)?;
+        Ok(())
     }
     pub fn update(&mut self, id: i64, p: ItemPatch) -> Result<()> {
         let old = self.get(id)?;
@@ -709,6 +806,7 @@ impl Store {
             && (p.title.is_some()
                 || p.note.is_some()
                 || p.favorite.is_some()
+                || p.pinned.is_some()
                 || p.collections.is_some())
         {
             return Err("Restore an item before editing it".into());
@@ -740,7 +838,7 @@ impl Store {
         if old.deleted && p.deleted == Some(false) && !old.favorite {
             let count: i64 = tx
                 .query_row(
-                    "SELECT count(*) FROM items WHERE favorite=0 AND deleted_at IS NULL",
+                    "SELECT count(*) FROM items WHERE favorite=0 AND pinned=0 AND deleted_at IS NULL",
                     [],
                     |r| r.get(0),
                 )
@@ -752,12 +850,13 @@ impl Store {
             }
         }
         tx.execute(
-            "UPDATE items SET title=?1,note=?2,favorite=?3,deleted_at=?4 WHERE id=?5",
+            "UPDATE items SET title=?1,note=?2,favorite=?3,deleted_at=?4,pinned=?5 WHERE id=?6",
             params![
                 p.title.unwrap_or(old.title),
                 p.note.unwrap_or(old.note),
                 p.favorite.unwrap_or(old.favorite),
                 deleted_at,
+                p.pinned.unwrap_or(old.pinned),
                 id
             ],
         )
@@ -884,8 +983,8 @@ impl Store {
     }
     pub fn maintain(&mut self, at: i64) -> Result<bool> {
         let tx = self.conn.transaction().map_err(db)?;
-        let a=tx.execute("UPDATE items SET deleted_at=?1 WHERE favorite=0 AND deleted_at IS NULL AND captured_at<=?2",params![at,at-self.settings.retention_days*DAY]).map_err(db)?;
-        let b=tx.execute("UPDATE items SET deleted_at=?1 WHERE id IN(SELECT id FROM items WHERE favorite=0 AND deleted_at IS NULL ORDER BY captured_at DESC,id DESC LIMIT -1 OFFSET ?2)",params![at,self.settings.max_items]).map_err(db)?;
+        let a=tx.execute("UPDATE items SET deleted_at=?1 WHERE favorite=0 AND pinned=0 AND deleted_at IS NULL AND captured_at<=?2",params![at,at-self.settings.retention_days*DAY]).map_err(db)?;
+        let b=tx.execute("UPDATE items SET deleted_at=?1 WHERE id IN(SELECT id FROM items WHERE favorite=0 AND pinned=0 AND deleted_at IS NULL ORDER BY captured_at DESC,id DESC LIMIT -1 OFFSET ?2)",params![at,self.settings.max_items]).map_err(db)?;
         let c = tx
             .execute(
                 "DELETE FROM items WHERE deleted_at IS NOT NULL AND deleted_at<=?1",
@@ -979,7 +1078,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let old = store.get(1).unwrap();
         assert_eq!(old.title, "旧记录");
         assert_eq!(old.source, "未知来源");
@@ -1012,7 +1111,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let old = store.get(1).unwrap();
         assert_eq!(old.file_size, 0);
         assert!(old.files.is_empty());
@@ -1044,7 +1143,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let old = store.get(1).unwrap();
         assert_eq!(old.source, "未知来源");
         assert_eq!(old.use_count, 0);
@@ -1355,5 +1454,138 @@ mod tests {
         let c = Capture::rgba(1, 1, &[4, 5, 6, 255]).unwrap();
         assert!(s.capture(&c, now()).unwrap_err().contains("500 MiB"));
         assert!(s.capture(&text("text still works"), now()).is_ok());
+    }
+    #[test]
+    fn pin_flag_survives_updates_and_trash_restore() {
+        let mut s = memory();
+        let at = now();
+        let id = s.capture(&text("synthetic pin"), at).unwrap();
+        assert!(!s.get(id).unwrap().pinned);
+        s.update(
+            id,
+            ItemPatch {
+                pinned: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(s.get(id).unwrap().pinned);
+        s.update(
+            id,
+            ItemPatch {
+                deleted: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(s
+            .update(
+                id,
+                ItemPatch {
+                    pinned: Some(false),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        s.update(
+            id,
+            ItemPatch {
+                deleted: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(s.get(id).unwrap().pinned);
+        s.settings.max_items = 1;
+        let later = now();
+        s.capture(&text("newer a"), later).unwrap();
+        s.capture(&text("newer b"), later + 1).unwrap();
+        assert!(!s.get(id).unwrap().deleted, "pinned items bypass retention");
+    }
+    #[test]
+    fn trigram_search_tracks_updates_and_short_queries() {
+        let mut s = memory();
+        let at = now();
+        let id = s.capture(&text("Synthetic alpha body"), at).unwrap();
+        assert_eq!(s.search("alpha body").unwrap(), vec![id]);
+        assert_eq!(s.search("ALPHA").unwrap(), vec![id]);
+        assert_eq!(s.search("al").unwrap(), vec![id]);
+        assert!(s.search("\"alpha").unwrap().is_empty());
+        s.update(
+            id,
+            ItemPatch {
+                title: Some("renamed needle".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.search("renamed needle").unwrap(), vec![id]);
+        s.update(
+            id,
+            ItemPatch {
+                deleted: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.purge(id).unwrap();
+        assert!(s.search("renamed needle").unwrap().is_empty());
+    }
+    #[test]
+    fn backup_round_trip_restores_items_collections_and_pins() {
+        let mut s = memory();
+        let at = now();
+        let id = s.capture(&text("backup synthetic body"), at).unwrap();
+        s.create_collection("BackupKit").unwrap();
+        s.update(
+            id,
+            ItemPatch {
+                favorite: Some(true),
+                pinned: Some(true),
+                note: Some("keep me".into()),
+                collections: Some(vec!["BackupKit".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.sqlite3");
+        s.export_to(&path).unwrap();
+        assert!(path.exists());
+        let mut fresh = memory();
+        fresh.capture(&text("will be replaced"), at + 1).unwrap();
+        fresh.import_from(&path).unwrap();
+        assert_eq!(fresh.list().unwrap().len(), 1);
+        let got = fresh.get(id).unwrap();
+        assert!(got.favorite && got.pinned);
+        assert_eq!(got.note, "keep me");
+        assert_eq!(got.collections, vec!["BackupKit"]);
+        assert_eq!(fresh.search("synthetic body").unwrap(), vec![id]);
+    }
+    #[test]
+    fn schema_v4_backup_import_defaults_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v4.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, hash TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL, png BLOB, note TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, file_size INTEGER NOT NULL DEFAULT 0, file_modified INTEGER, meta TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '', thumb BLOB, last_used INTEGER, use_count INTEGER NOT NULL DEFAULT 0, captured_at INTEGER NOT NULL, deleted_at INTEGER, UNIQUE(kind,hash));
+             CREATE TABLE collections(name TEXT PRIMARY KEY COLLATE NOCASE);
+             CREATE TABLE members(item_id INTEGER, name TEXT COLLATE NOCASE, PRIMARY KEY(item_id,name));
+             CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             PRAGMA user_version=4;
+             INSERT INTO items(kind,hash,title,content,captured_at) VALUES('text','old-v4','旧备份','正文',{});
+             INSERT INTO collections(name) VALUES('旧集合');
+             INSERT INTO members(item_id,name) VALUES(1,'旧集合');",
+            now()
+        ))
+        .unwrap();
+        drop(conn);
+        let mut s = memory();
+        s.import_from(&path).unwrap();
+        let got = s.get(1).unwrap();
+        assert_eq!(got.title, "旧备份");
+        assert!(!got.pinned);
+        assert_eq!(got.collections, vec!["旧集合"]);
+        assert_eq!(s.search("旧备份").unwrap(), vec![1]);
     }
 }

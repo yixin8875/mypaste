@@ -9,7 +9,8 @@
     "allow-get-snapshot", "allow-get-item", "allow-search-items", "allow-update-item",
     "allow-purge-item", "allow-create-collection", "allow-update-settings",
     "allow-copy-item", "allow-get-image", "allow-get-thumbnail", "allow-paste-item", "allow-open-link",
-    "allow-hide-quick-window",
-    "updater:default", "process:allow-restart"
+    "allow-hide-quick-window", "allow-export-backup", "allow-import-backup",
+    "allow-open-data-dir", "allow-set-data-dir",
+    "updater:default", "process:allow-restart", "dialog:default"
   ]
 }

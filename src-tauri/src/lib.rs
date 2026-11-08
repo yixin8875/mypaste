@@ -1,4 +1,5 @@
 mod platform;
+mod storage;
 mod store;
 use base64::Engine;
 use serde::Serialize;
@@ -30,6 +31,7 @@ struct Snapshot {
     settings: Settings,
     status: Status,
     data_dir: String,
+    storage_error: Option<String>,
 }
 #[derive(Serialize)]
 struct PasteOutcome {
@@ -120,10 +122,12 @@ struct QuickUi {
     loaded: bool,
     pending: bool,
     shown_at: Option<Instant>,
+    target: isize,
 }
 struct AppState {
     inner: Arc<Mutex<Inner>>,
     data_dir: String,
+    storage_error: Option<String>,
     quick: Arc<Mutex<QuickSession>>,
     quick_ui: Mutex<QuickUi>,
     stop: Arc<AtomicBool>,
@@ -180,6 +184,7 @@ fn get_snapshot(
         settings: s.store.settings.clone(),
         status: s.status(),
         data_dir: state.data_dir.clone(),
+        storage_error: state.storage_error.clone(),
     })
 }
 #[tauri::command]
@@ -535,6 +540,102 @@ fn hide_quick_window(
         .hide()
         .map_err(|e| format!("Cannot hide quick window: {e}"))
 }
+fn live_database(state: &AppState) -> std::path::PathBuf {
+    std::path::Path::new(&state.data_dir).join("history.sqlite3")
+}
+#[tauri::command]
+fn export_backup(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<String> {
+    allowed(&window)?;
+    if window.label() != "main" {
+        return Err("Backups can only be exported from the main window".into());
+    }
+    let target = std::path::PathBuf::from(&path);
+    if !target.is_absolute() {
+        return Err("备份路径必须是绝对路径".into());
+    }
+    if target == live_database(&state) {
+        return Err("不能覆盖当前正在使用的数据库".into());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("无法创建备份目录：{e}"))?;
+    }
+    if target.exists() {
+        std::fs::remove_file(&target).map_err(|e| format!("无法覆盖已有备份文件：{e}"))?;
+    }
+    lock(&state)?.store.export_to(&target)?;
+    Ok(path)
+}
+#[tauri::command]
+fn import_backup(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<()> {
+    allowed(&window)?;
+    if window.label() != "main" {
+        return Err("Backups can only be restored from the main window".into());
+    }
+    let source = std::path::PathBuf::from(&path);
+    if !source.is_absolute() || !source.is_file() {
+        return Err("请选择有效的备份文件".into());
+    }
+    if source == live_database(&state) {
+        return Err("不能从当前正在使用的数据库恢复".into());
+    }
+    lock(&state)?.store.import_from(&source)?;
+    changed(&app);
+    Ok(())
+}
+#[tauri::command]
+fn open_data_dir(window: tauri::WebviewWindow, state: tauri::State<'_, AppState>) -> Result<()> {
+    allowed(&window)?;
+    open::that(&state.data_dir).map_err(|e| format!("无法打开数据目录：{e}"))
+}
+#[tauri::command]
+fn set_data_dir(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<()> {
+    if window.label() != "main" {
+        return Err("只能从主窗口修改存储路径".into());
+    }
+    if cfg!(debug_assertions) && std::env::var_os("MYPASTE_DATA_DIR").is_some() {
+        return Err("当前由 MYPASTE_DATA_DIR 指定存储位置，无法在此修改".into());
+    }
+    let target = std::path::PathBuf::from(&path);
+    if !target.is_absolute() {
+        return Err("存储路径必须是绝对路径".into());
+    }
+    std::fs::create_dir_all(&target).map_err(|e| format!("无法创建目标目录：{e}"))?;
+    let current =
+        std::fs::canonicalize(&state.data_dir).map_err(|e| format!("无法读取当前目录：{e}"))?;
+    let target = std::fs::canonicalize(&target).map_err(|e| format!("无法读取目标目录：{e}"))?;
+    if current == target {
+        return Err("已经是当前存储位置".into());
+    }
+    if target.join("history.sqlite3").exists() {
+        return Err("目标目录已有 MyPaste 数据，请选择空目录".into());
+    }
+    let probe = target.join(".mypaste-write-probe");
+    std::fs::write(&probe, b"1").map_err(|e| format!("目标目录不可写：{e}"))?;
+    let _ = std::fs::remove_file(&probe);
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    storage::save(
+        &config_dir,
+        &storage::StorageConfig {
+            data_dir: Some(state.data_dir.clone()),
+            pending_dir: Some(target.to_string_lossy().into_owned()),
+        },
+    )?;
+    app.restart()
+}
 
 fn quick_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow> {
     if let Some(window) = app.get_webview_window("quick") {
@@ -597,6 +698,12 @@ fn quick_focus_grace(state: &AppState) -> bool {
         .is_some_and(|at| at.elapsed() < Duration::from_millis(600))
 }
 fn show_quick_window(window: &tauri::WebviewWindow, state: &AppState) -> Result<()> {
+    let target = state
+        .quick_ui
+        .lock()
+        .map(|ui| ui.target)
+        .unwrap_or(0);
+    position_quick(window, target)?;
     if let Ok(mut ui) = state.quick_ui.lock() {
         ui.shown_at = Some(Instant::now());
     }
@@ -604,6 +711,25 @@ fn show_quick_window(window: &tauri::WebviewWindow, state: &AppState) -> Result<
     window.show().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())?;
     Ok(())
+}
+/// Center the quick window on the monitor that showed the app at shortcut time,
+/// so multi-monitor users do not have to chase it back to the primary display.
+fn position_quick(window: &tauri::WebviewWindow, target: isize) -> Result<()> {
+    let Some((left, top, right, bottom)) = platform::work_area(target) else {
+        return Ok(());
+    };
+    let size = window.outer_size().map_err(|e| e.to_string())?;
+    let (width, height) = (size.width as i32, size.height as i32);
+    let (area_width, area_height) = (right - left, bottom - top);
+    if width <= 0 || height <= 0 || width > area_width || height > area_height {
+        return Ok(());
+    }
+    window
+        .set_position(tauri::PhysicalPosition::new(
+            left + (area_width - width) / 2,
+            top + (area_height - height) / 2,
+        ))
+        .map_err(|e| e.to_string())
 }
 fn quick_window_ready(window: &tauri::WebviewWindow) {
     let Some(state) = window.try_state::<AppState>() else {
@@ -629,6 +755,9 @@ fn open_quick(app: &tauri::AppHandle) -> Result<()> {
     let already_open = window.is_visible().unwrap_or(false) && window.is_focused().unwrap_or(false);
     if !already_open {
         let (target, pid) = platform::foreground();
+        if let Ok(mut ui) = state.quick_ui.lock() {
+            ui.target = target;
+        }
         state
             .quick
             .lock()
@@ -852,16 +981,22 @@ fn start_workers(app: &tauri::AppHandle) -> Result<()> {
     Ok(())
 }
 fn setup(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut dir = app.path().app_local_data_dir()?;
-    if cfg!(debug_assertions) {
-        if let Some(value) = std::env::var_os("MYPASTE_DATA_DIR") {
-            let path = std::path::PathBuf::from(value);
-            if !path.is_absolute() {
-                return Err("MYPASTE_DATA_DIR must be an absolute path".into());
-            }
-            dir = path;
+    let default_dir = app.path().app_local_data_dir()?;
+    let env_dir = if cfg!(debug_assertions) {
+        std::env::var_os("MYPASTE_DATA_DIR").map(std::path::PathBuf::from)
+    } else {
+        None
+    };
+    let (dir, storage_error) = if let Some(dir) = env_dir {
+        if !dir.is_absolute() {
+            return Err("MYPASTE_DATA_DIR must be an absolute path".into());
         }
-    }
+        (dir, None)
+    } else {
+        let config_dir = app.path().app_config_dir()?;
+        std::fs::create_dir_all(&config_dir)?;
+        storage::resolve(&config_dir, &default_dir)?
+    };
     std::fs::create_dir_all(&dir)?;
     let store = Store::open(&dir.join("history.sqlite3"))?;
     let shortcut = store.settings.shortcut.clone();
@@ -876,6 +1011,7 @@ fn setup(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Er
             own: None,
         })),
         data_dir: dir.to_string_lossy().into_owned(),
+        storage_error,
         quick: Arc::new(Mutex::new(QuickSession::default())),
         quick_ui: Mutex::new(QuickUi::default()),
         stop: Arc::new(AtomicBool::new(false)),
@@ -975,6 +1111,7 @@ pub fn run() {
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(setup)
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1000,7 +1137,11 @@ pub fn run() {
             get_thumbnail,
             paste_item,
             open_link,
-            hide_quick_window
+            hide_quick_window,
+            export_backup,
+            import_backup,
+            open_data_dir,
+            set_data_dir
         ])
         .build(tauri::generate_context!())
         .expect("MyPaste native initialization failed");
