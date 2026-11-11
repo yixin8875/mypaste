@@ -98,6 +98,25 @@
 .settings-notice{font-size:12px;line-height:1.8;color:#5f6b7a}
 .settings-tabs button{color:#5f6b7a}
 .exclude-chip{font-size:11px;color:#5f6b7a}
+.settings-group{font-size:12px;font-weight:600;color:#5f6b7a;margin:18px 0 2px;padding-top:14px;border-top:1px solid #edf0f4}
+.settings-group:first-child{margin-top:0;padding-top:0;border-top:0}
+.list-heading>div>span{font-size:11px;color:#66717f}
+.list-toolbar{font-size:11px;color:#66717f}
+.list-toolbar select{font-size:11px;color:#4b5665}
+.detail-title-row{align-items:flex-start}
+.detail-title-actions{display:flex;align-items:center;gap:2px;margin-left:4px;flex-shrink:0;padding-top:4px}
+.detail-title-actions .icon-button{width:30px;height:30px}
+.detail-content h3{font-size:12px;color:#4b5665}
+.collection-name small{font-size:10px;color:#66717f}
+.policy-summary{display:inline-flex;align-items:center;gap:4px;flex-shrink:0;max-width:200px;white-space:nowrap;border:1px solid #e2e8f0;border-radius:6px;background:#fafbfd;padding:3px 7px;font-size:11px;color:#5f6b7a}
+.policy-summary:hover{background:#f2f6fc;border-color:#cfd9e6}
+.policy-summary.custom{color:#3f669c;background:#f3f7fe;border-color:#d8e5f8}
+.policy-summary svg{transition:transform .15s}
+.policy-summary.open svg{transform:rotate(180deg)}
+.collection-policy{gap:10px;padding:4px 0 8px 24px}
+.collection-policy label{font-size:11px;color:#5f6b7a}
+.collection-policy select{font-size:11px;padding:4px 20px 4px 7px}
+.collection-policy .text-button{margin-left:auto}
 
 /* Quick window: compact chrome, search as the focal point, filters and sort clearly separated. */
 .quick-modal>.modal-title{padding:9px 16px}

@@ -37,6 +37,8 @@ afterEach(async () => { await act(async () => root.unmount()); host.remove(); vi
 describe('原生适配异步交互', () => {
   it('详情读完整正文，复制按ID而非摘要', async () => {
     await render(<App/>); expect(host.querySelector('pre')?.textContent).toBe(fullText)
+    expect(host.querySelector('.detail-toolbar')).toBeNull()
+    expect(host.querySelector('.detail-title-actions [aria-label="收藏记录"]')).not.toBeNull()
     await click('.primary-actions .primary-button'); expect(api.copy).toHaveBeenCalledWith(1)
     expect(host.querySelector('[role="status"]')?.textContent).toBe('已复制到剪贴板')
   })
@@ -261,11 +263,31 @@ describe('原生适配异步交互', () => {
     })
     await render(<App/>)
     await click('[aria-label="管理集合"]')
+    expect(host.querySelector('.policy-summary')?.textContent).toContain('跟随全局')
+    await click('.policy-summary')
     await choose(host.querySelector<HTMLSelectElement>('[aria-label="素材 保留时间"]')!, '90')
     expect(api.setCollectionPolicy).toHaveBeenCalledWith('素材', 90, null)
     await choose(host.querySelector<HTMLSelectElement>('[aria-label="素材 条数上限"]')!, '1000')
     expect(api.setCollectionPolicy).toHaveBeenCalledWith('素材', 90, 1000)
+    expect(host.querySelector('.policy-summary')?.textContent).toContain('保留 90 天 · 上限 1,000 条')
     expect(host.querySelector('[role="status"]')?.textContent).toContain('已更新「素材」的保留策略')
+  })
+  it('设置页直接显示控件，数据页按组呈现', async () => {
+    await render(<App/>)
+    await click('header [aria-label="设置"]')
+    expect(host.querySelector('.settings-intro')).toBeNull()
+    expect(host.textContent).toContain('快捷呼出')
+    await clickText('.settings-tabs button', '数据')
+    expect([...host.querySelectorAll('.settings-group')].map(group => group.textContent).join(' ')).toContain('备份')
+    expect([...host.querySelectorAll('.settings-group')].map(group => group.textContent).join(' ')).toContain('维护与诊断')
+  })
+  it('列表头不复述装饰文案，类型筛选只保留侧栏入口', async () => {
+    await render(<App/>)
+    const meta = host.querySelector('.list-heading > div > span')?.textContent ?? ''
+    expect(meta).toContain('条记录')
+    expect(meta).not.toContain('留住每一次灵感')
+    expect(host.querySelector('[aria-label="内容类型筛选"]')).toBeNull()
+    expect(host.querySelector('[aria-label="来源应用筛选"]')).not.toBeNull()
   })
   it('设置页展示诊断日志并可导出，管理员重启需确认', async () => {
     await render(<App/>)
