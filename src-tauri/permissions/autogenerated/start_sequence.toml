@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-sequence"
+description = "Enables the start_sequence command without any pre-configured scope."
+commands.allow = ["start_sequence"]
+
+[[permission]]
+identifier = "deny-start-sequence"
+description = "Denies the start_sequence command without any pre-configured scope."
+commands.deny = ["start_sequence"]

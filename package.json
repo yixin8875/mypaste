@@ -12,7 +12,10 @@
     "desktop:build": "tauri build",
     "test": "vitest run",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
-    "test:native": "node scripts/native-smoke.mjs"
+    "test:native": "node scripts/native-smoke.mjs",
+    "test:native:p2b": "node scripts/native-p2b.mjs",
+    "test:portable": "node scripts/portable.mjs --self-test",
+    "portable:package": "node scripts/portable.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",

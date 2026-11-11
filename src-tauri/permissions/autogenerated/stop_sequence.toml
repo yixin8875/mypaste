@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stop-sequence"
+description = "Enables the stop_sequence command without any pre-configured scope."
+commands.allow = ["stop_sequence"]
+
+[[permission]]
+identifier = "deny-stop-sequence"
+description = "Denies the stop_sequence command without any pre-configured scope."
+commands.deny = ["stop_sequence"]

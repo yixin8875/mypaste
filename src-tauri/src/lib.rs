@@ -1,3 +1,4 @@
+mod logging;
 mod platform;
 mod storage;
 mod store;
@@ -11,7 +12,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use store::{Clip, ItemPatch, Result, Settings, SettingsPatch, Store};
+use store::{Clip, CollectionPolicy, ItemPatch, Result, Settings, SettingsPatch, Store};
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
@@ -23,13 +24,17 @@ struct Status {
     shortcut_registered: bool,
     shortcut_error: Option<String>,
     autostart: bool,
+    elevated: bool,
+    portable: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Snapshot {
     items: Vec<Clip>,
     collections: Vec<String>,
+    collection_policies: Vec<CollectionPolicy>,
     settings: Settings,
+    sequence: SequenceStatus,
     status: Status,
     data_dir: String,
     storage_error: Option<String>,
@@ -39,6 +44,40 @@ struct PasteOutcome {
     copied: bool,
     status: &'static str,
     reason: Option<String>,
+}
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SequenceStatus {
+    active: bool,
+    total: usize,
+    position: usize,
+    current_title: Option<String>,
+    remaining: usize,
+}
+#[derive(Clone, Debug)]
+struct Sequence {
+    entries: Vec<(i64, String)>,
+    next: usize,
+    started_at: Instant,
+}
+const SEQUENCE_IDLE: Duration = Duration::from_secs(600);
+impl Sequence {
+    fn status(&self) -> SequenceStatus {
+        SequenceStatus {
+            active: !self.entries.is_empty() && self.next < self.entries.len(),
+            total: self.entries.len(),
+            position: self.next,
+            current_title: self
+                .next
+                .checked_sub(1)
+                .and_then(|index| self.entries.get(index))
+                .map(|(_, title)| title.clone()),
+            remaining: self.entries.len().saturating_sub(self.next),
+        }
+    }
+    fn expired(&self) -> bool {
+        self.started_at.elapsed() > SEQUENCE_IDLE
+    }
 }
 struct OwnWrite {
     sequence: u32,
@@ -57,8 +96,11 @@ struct Inner {
     shortcut_registered: bool,
     shortcut_error: Option<String>,
     autostart: bool,
+    elevated: bool,
+    portable: bool,
     baseline: u32,
     own: Option<OwnWrite>,
+    sequence: Option<Sequence>,
 }
 impl Inner {
     fn status(&self) -> Status {
@@ -75,6 +117,8 @@ impl Inner {
             shortcut_registered: self.shortcut_registered,
             shortcut_error: self.shortcut_error.clone(),
             autostart: self.autostart,
+            elevated: self.elevated,
+            portable: self.portable,
         }
     }
 }
@@ -130,6 +174,7 @@ struct QuickUi {
 struct AppState {
     inner: Arc<Mutex<Inner>>,
     data_dir: String,
+    portable: bool,
     storage_error: Option<String>,
     quick: Arc<Mutex<QuickSession>>,
     quick_ui: Mutex<QuickUi>,
@@ -198,7 +243,13 @@ fn get_snapshot(
     Ok(Snapshot {
         items: s.store.list()?,
         collections: s.store.collections()?,
+        collection_policies: s.store.collection_policies()?,
         settings: s.store.settings.clone(),
+        sequence: s
+            .sequence
+            .as_ref()
+            .map(Sequence::status)
+            .unwrap_or_default(),
         status: s.status(),
         data_dir: state.data_dir.clone(),
         storage_error: state.storage_error.clone(),
@@ -325,6 +376,23 @@ fn add_to_collection(
     changed(&app);
     Ok(())
 }
+/// Set or clear one collection's retention override. Missing values follow global settings.
+#[tauri::command]
+fn set_collection_policy(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    name: String,
+    retention_days: Option<i64>,
+    max_items: Option<i64>,
+) -> Result<()> {
+    allowed(&window)?;
+    lock(&state)?
+        .store
+        .set_collection_policy(&name, retention_days, max_items)?;
+    changed(&app);
+    Ok(())
+}
 
 fn set_settings(app: &tauri::AppHandle, state: &AppState, patch: SettingsPatch) -> Result<()> {
     let mut s = lock(state)?;
@@ -406,8 +474,7 @@ fn update_settings(
     allowed(&window)?;
     set_settings(&app, &state, patch)
 }
-fn copy_native(state: &AppState, id: i64) -> Result<u32> {
-    let mut s = lock(state)?;
+fn copy_locked(s: &mut Inner, id: i64) -> Result<u32> {
     let item = s.store.get(id)?;
     if item.deleted {
         return Err("Restore this item before copying".into());
@@ -448,6 +515,215 @@ fn copy_native(state: &AppState, id: i64) -> Result<u32> {
     }
     Ok(sequence)
 }
+fn copy_native(state: &AppState, id: i64) -> Result<u32> {
+    let mut inner = lock(state)?;
+    copy_locked(&mut inner, id)
+}
+fn sequence_entries(store: &Store, ids: &[i64]) -> Result<Vec<(i64, String)>> {
+    if ids.is_empty() {
+        return Err("请至少选择一条记录".into());
+    }
+    if ids.len() > 200 {
+        return Err("一次最多序列粘贴 200 条记录".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for id in ids {
+        if !seen.insert(*id) {
+            continue;
+        }
+        let item = store.get(*id)?;
+        if item.deleted {
+            return Err("请先恢复最近删除中的记录，再开始序列粘贴".into());
+        }
+        entries.push((*id, item.title));
+    }
+    Ok(entries)
+}
+/// Copy the next queued record inside an existing coordinator lock.
+/// `Ok(None)` means no live sequence (never started, finished or expired).
+fn sequence_advance_locked(s: &mut Inner) -> Result<Option<(SequenceStatus, u32)>> {
+    let Some(sequence) = s.sequence.as_ref() else {
+        return Ok(None);
+    };
+    if sequence.expired() {
+        s.sequence = None;
+        logging::event("WARN", "Sequence expired after 10 minutes idle");
+        return Ok(None);
+    }
+    let index = sequence.next;
+    let id = sequence.entries[index].0;
+    let copied = match copy_locked(s, id) {
+        Ok(sequence) => sequence,
+        Err(error) => {
+            s.sequence = None;
+            return Err(error);
+        }
+    };
+    let status = {
+        let sequence = s.sequence.as_mut().expect("sequence checked above");
+        sequence.next = index + 1;
+        sequence.started_at = Instant::now();
+        sequence.status()
+    };
+    if status.remaining == 0 {
+        s.sequence = None;
+    }
+    Ok(Some((status, copied)))
+}
+fn sequence_start_locked(s: &mut Inner, ids: &[i64]) -> Result<SequenceStatus> {
+    let entries = sequence_entries(&s.store, ids)?;
+    let first = entries[0].0;
+    copy_locked(s, first)?;
+    let total = entries.len();
+    let current_title = entries.first().map(|(_, title)| title.clone());
+    if total > 1 {
+        s.sequence = Some(Sequence {
+            entries,
+            next: 1,
+            started_at: Instant::now(),
+        });
+        Ok(s.sequence
+            .as_ref()
+            .map(Sequence::status)
+            .unwrap_or_default())
+    } else {
+        s.sequence = None;
+        Ok(SequenceStatus {
+            active: false,
+            total,
+            position: 1,
+            current_title,
+            remaining: 0,
+        })
+    }
+}
+fn sequence_changed(app: &tauri::AppHandle, status: &SequenceStatus) {
+    if let Err(error) = app.emit_to("main", "sequence://changed", status.clone()) {
+        eprintln!("Sequence event delivery failed: {error}");
+    }
+}
+/// The global shortcut doubles as "paste the next item" while a sequence is active.
+/// It never advances while the quick panel is open, so re-summoning still works.
+fn try_sequence_shortcut(app: &tauri::AppHandle) -> bool {
+    if app
+        .get_webview_window("quick")
+        .is_some_and(|window| window.is_visible().unwrap_or(false))
+    {
+        return false;
+    }
+    let (target, pid) = platform::foreground();
+    let state = app.state::<AppState>();
+    let advanced = match state.inner.lock() {
+        Ok(mut inner) => match sequence_advance_locked(&mut inner) {
+            Ok(value) => value,
+            Err(error) => {
+                logging::event("ERROR", &format!("Sequence copy failed: {error}"));
+                system_notify(app, &format!("序列粘贴已结束：{error}"));
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    let Some((status, clipboard_sequence)) = advanced else {
+        return false;
+    };
+    changed(app);
+    sequence_changed(app, &status);
+    logging::event(
+        "INFO",
+        &format!("Sequence advanced to {}/{}", status.position, status.total),
+    );
+    if target == 0 {
+        system_notify(
+            app,
+            &format!(
+                "已复制序列第 {}/{} 项，请到目标应用粘贴",
+                status.position, status.total
+            ),
+        );
+        return true;
+    }
+    let handle = app.clone();
+    thread::spawn(move || {
+        if let Err(reason) = platform::paste(target, pid, clipboard_sequence) {
+            system_notify(&handle, &reason);
+        }
+    });
+    true
+}
+#[tauri::command]
+fn start_sequence(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    ids: Vec<i64>,
+) -> Result<SequenceStatus> {
+    if window.label() != "main" {
+        return Err("只能从主窗口开始序列粘贴".into());
+    }
+    let mut inner = lock(&state)?;
+    let status = sequence_start_locked(&mut inner, &ids)?;
+    drop(inner);
+    changed(&app);
+    sequence_changed(&app, &status);
+    logging::event(
+        "INFO",
+        &format!(
+            "Sequence started with {} item(s); first copied",
+            status.total
+        ),
+    );
+    Ok(status)
+}
+#[tauri::command]
+fn sequence_status(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+) -> Result<SequenceStatus> {
+    allowed(&window)?;
+    Ok(lock(&state)?
+        .sequence
+        .as_ref()
+        .map(Sequence::status)
+        .unwrap_or_default())
+}
+#[tauri::command]
+fn sequence_next(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<SequenceStatus> {
+    if window.label() != "main" {
+        return Err("只能从主窗口推进序列粘贴".into());
+    }
+    let mut inner = lock(&state)?;
+    let status = sequence_advance_locked(&mut inner)?
+        .map(|(status, _)| status)
+        .unwrap_or_default();
+    drop(inner);
+    changed(&app);
+    sequence_changed(&app, &status);
+    Ok(status)
+}
+#[tauri::command]
+fn stop_sequence(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<SequenceStatus> {
+    if window.label() != "main" {
+        return Err("只能从主窗口结束序列粘贴".into());
+    }
+    let mut inner = lock(&state)?;
+    let status = SequenceStatus::default();
+    if inner.sequence.take().is_some() {
+        logging::event("INFO", "Sequence stopped by the user");
+    }
+    drop(inner);
+    sequence_changed(&app, &status);
+    Ok(status)
+}
 #[tauri::command]
 fn copy_item(
     window: tauri::WebviewWindow,
@@ -456,7 +732,10 @@ fn copy_item(
     id: i64,
 ) -> Result<()> {
     allowed(&window)?;
-    copy_native(&state, id)?;
+    copy_native(&state, id).map_err(|error| {
+        logging::event("ERROR", &format!("Copy failed for item {id}: {error}"));
+        error
+    })?;
     changed(&app);
     // The quick window closes right after copying; confirm the result in the system tray area.
     if window.label() == "quick" {
@@ -519,7 +798,13 @@ fn copy_item_variant(
     mode: String,
 ) -> Result<()> {
     allowed(&window)?;
-    copy_variant_native(&state, id, &mode)?;
+    copy_variant_native(&state, id, &mode).map_err(|error| {
+        logging::event(
+            "ERROR",
+            &format!("Copy variant failed for item {id}: {error}"),
+        );
+        error
+    })?;
     changed(&app);
     if window.label() == "quick" {
         let label = match mode.as_str() {
@@ -579,7 +864,13 @@ fn copy_item_format(
     format: String,
 ) -> Result<()> {
     allowed(&window)?;
-    copy_format_native(&state, id, &format)?;
+    copy_format_native(&state, id, &format).map_err(|error| {
+        logging::event(
+            "ERROR",
+            &format!("Copy format {format} failed for item {id}: {error}"),
+        );
+        error
+    })?;
     changed(&app);
     if window.label() == "quick" {
         system_notify(
@@ -800,6 +1091,7 @@ fn export_backup(
         std::fs::remove_file(&target).map_err(|e| format!("无法覆盖已有备份文件：{e}"))?;
     }
     lock(&state)?.store.export_to(&target)?;
+    logging::event("INFO", "Backup exported");
     Ok(path)
 }
 #[tauri::command]
@@ -821,6 +1113,7 @@ fn import_backup(
         return Err("不能从当前正在使用的数据库恢复".into());
     }
     lock(&state)?.store.import_from(&source)?;
+    logging::event("INFO", "Backup restored");
     changed(&app);
     Ok(())
 }
@@ -838,6 +1131,9 @@ fn set_data_dir(
 ) -> Result<()> {
     if window.label() != "main" {
         return Err("只能从主窗口修改存储路径".into());
+    }
+    if state.portable {
+        return Err("便携模式的数据固定保存在程序目录，无法在此修改".into());
     }
     if cfg!(debug_assertions) && std::env::var_os("MYPASTE_DATA_DIR").is_some() {
         return Err("当前由 MYPASTE_DATA_DIR 指定存储位置，无法在此修改".into());
@@ -924,6 +1220,104 @@ fn set_autostart(
     platform::set_autostart(enabled)?;
     lock(&state)?.autostart = enabled;
     Ok(enabled)
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogInfo {
+    dir: String,
+    file: String,
+    bytes: u64,
+}
+fn log_info() -> LogInfo {
+    LogInfo {
+        dir: logging::dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        file: logging::file()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        bytes: logging::size(),
+    }
+}
+#[tauri::command]
+fn get_log_info(window: tauri::WebviewWindow) -> Result<LogInfo> {
+    allowed(&window)?;
+    Ok(log_info())
+}
+#[tauri::command]
+fn open_log_dir(window: tauri::WebviewWindow, state: tauri::State<'_, AppState>) -> Result<()> {
+    if window.label() != "main" {
+        return Err("只能从主窗口打开日志目录".into());
+    }
+    let _ = &state;
+    let dir = logging::dir().ok_or("诊断日志目录不可用")?;
+    open::that(dir).map_err(|e| format!("无法打开日志目录：{e}"))
+}
+/// Write a plain-text support snapshot: app/system metadata, counts and recent
+/// diagnostics. Clipboard bodies, search terms and window titles are never included.
+#[tauri::command]
+fn export_diagnostics(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<String> {
+    if window.label() != "main" {
+        return Err("只能从主窗口导出诊断信息".into());
+    }
+    let target = std::path::PathBuf::from(&path);
+    if !target.is_absolute() {
+        return Err("诊断文件路径必须是绝对路径".into());
+    }
+    if target == live_database(&state) {
+        return Err("不能覆盖当前数据库".into());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("无法创建诊断目录：{e}"))?;
+    }
+    let (items, trashed) = lock(&state)?.store.counts()?;
+    let inner = lock(&state)?;
+    let settings = &inner.store.settings;
+    let body = format!(
+        "MyPaste diagnostics\nversion: {}\nplatform: {} {}\ngenerated: {}\ndataDir: {}\nlogDir: {}\nportable: {}\nelevated: {}\npaused: {}\nretentionDays: {}\nmaxItems: {}\nshortcut: {}\nexcludedApps: {}\nitems: {items}\ntrashed: {trashed}\n\nrecent log:\n{}\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z"),
+        state.data_dir,
+        logging::dir()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        inner.portable,
+        inner.elevated,
+        settings.paused,
+        settings.retention_days,
+        settings.max_items,
+        settings.shortcut,
+        settings.excluded_apps.len(),
+        logging::tail(200).join("\n")
+    );
+    std::fs::write(&target, body).map_err(|e| format!("无法写入诊断文件：{e}"))?;
+    logging::event("INFO", "Diagnostics exported");
+    Ok(path)
+}
+/// Relaunch through the UAC prompt. Windows starts the elevated copy; this process
+/// exits only after the launch call succeeds, so a cancelled prompt keeps it running.
+#[tauri::command]
+fn restart_elevated(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<()> {
+    if window.label() != "main" {
+        return Err("只能从主窗口请求管理员启动".into());
+    }
+    if lock(&state)?.elevated {
+        return Err("当前已经是管理员权限".into());
+    }
+    platform::restart_elevated()?;
+    logging::event("INFO", "Relaunching with administrator privileges");
+    app.exit(0);
+    Ok(())
 }
 
 fn quick_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow> {
@@ -1130,6 +1524,7 @@ fn start_workers(app: &tauri::AppHandle) -> Result<()> {
             s.baseline = platform::sequence();
         }
         Err(error) => {
+            logging::event("ERROR", &format!("Clipboard listener failed: {error}"));
             let mut s = lock(&state)?;
             s.capture_error = Some(error);
         }
@@ -1199,6 +1594,10 @@ fn start_workers(app: &tauri::AppHandle) -> Result<()> {
                                                 None => c,
                                             };
                                             if let Err(error) = s.store.capture(&c, store::now()) {
+                                                logging::event(
+                                                    "ERROR",
+                                                    &format!("Capture storage failed: {error}"),
+                                                );
                                                 s.capture_error = Some(error);
                                                 drop(s);
                                                 status_changed(&handle);
@@ -1272,18 +1671,42 @@ fn setup(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Er
     } else {
         None
     };
-    let (dir, storage_error) = if let Some(dir) = env_dir {
+    let portable_dir = storage::current_portable_dir();
+    let (dir, storage_error, portable) = if let Some(dir) = env_dir {
         if !dir.is_absolute() {
             return Err("MYPASTE_DATA_DIR must be an absolute path".into());
         }
-        (dir, None)
+        (dir, None, false)
+    } else if let Some(dir) = portable_dir {
+        // A marker beside the executable wins over storage.json; the data directory
+        // travels with the program, so it can live on a USB stick.
+        (dir, None, true)
     } else {
         let config_dir = app.path().app_config_dir()?;
         std::fs::create_dir_all(&config_dir)?;
-        storage::resolve(&config_dir, &default_dir)?
+        let (dir, error) = storage::resolve(&config_dir, &default_dir)?;
+        (dir, error, false)
     };
     std::fs::create_dir_all(&dir)?;
-    let store = Store::open(&dir.join("history.sqlite3"))?;
+    if let Err(error) = logging::init(&dir) {
+        eprintln!("Diagnostic log unavailable: {error}");
+    }
+    let store = match Store::open(&dir.join("history.sqlite3")) {
+        Ok(store) => store,
+        Err(error) => {
+            logging::event("ERROR", &format!("Database open failed: {error}"));
+            return Err(error.into());
+        }
+    };
+    let elevated = platform::elevated();
+    logging::event(
+        "INFO",
+        &format!(
+            "MyPaste {} starting; data={}; portable={portable}; elevated={elevated}",
+            env!("CARGO_PKG_VERSION"),
+            dir.display()
+        ),
+    );
     let shortcut = store.settings.shortcut.clone();
     app.manage(AppState {
         inner: Arc::new(Mutex::new(Inner {
@@ -1293,10 +1716,14 @@ fn setup(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Er
             shortcut_registered: false,
             shortcut_error: None,
             autostart: platform::autostart_enabled(),
+            elevated,
+            portable,
             baseline: platform::sequence(),
             own: None,
+            sequence: None,
         })),
         data_dir: dir.to_string_lossy().into_owned(),
+        portable,
         storage_error,
         quick: Arc::new(Mutex::new(QuickSession::default())),
         quick_ui: Mutex::new(QuickUi::default()),
@@ -1318,6 +1745,10 @@ fn setup(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Er
     match app.global_shortcut().register(shortcut.as_str()) {
         Ok(()) => lock(&app.state::<AppState>())?.shortcut_registered = true,
         Err(error) => {
+            logging::event(
+                "WARN",
+                &format!("Global shortcut registration failed: {error}"),
+            );
             lock(&app.state::<AppState>())?.shortcut_error =
                 Some(format!("Global shortcut registration failed: {error}"))
         }
@@ -1378,6 +1809,11 @@ fn setup(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Er
 }
 
 pub fn run() {
+    // Portable mode keeps WebView2's profile beside the executable as well, so the
+    // whole folder can move without writing to %LOCALAPPDATA%.
+    if let Some(dir) = storage::current_portable_dir() {
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", dir.join("webview2"));
+    }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Err(error) = reveal(app, false) {
@@ -1388,6 +1824,9 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _, event| {
                     if event.state() == ShortcutState::Pressed {
+                        if try_sequence_shortcut(app) {
+                            return;
+                        }
                         if let Err(error) = reveal(app, true) {
                             report_desktop(app, error);
                         }
@@ -1438,7 +1877,16 @@ pub fn run() {
             copy_item_format,
             data_usage,
             compact_database,
-            set_autostart
+            set_autostart,
+            set_collection_policy,
+            start_sequence,
+            sequence_status,
+            sequence_next,
+            stop_sequence,
+            get_log_info,
+            open_log_dir,
+            export_diagnostics,
+            restart_elevated
         ])
         .build(tauri::generate_context!())
         .expect("MyPaste native initialization failed");
@@ -1568,6 +2016,61 @@ mod tests {
             select_rich("bogus", None, None).unwrap_err(),
             "未知的复制格式"
         );
+    }
+    #[test]
+    fn sequence_status_reports_progress_and_completion() {
+        let mut sequence = Sequence {
+            entries: vec![
+                (1, "第一条".into()),
+                (2, "第二条".into()),
+                (3, "第三条".into()),
+            ],
+            next: 1,
+            started_at: Instant::now(),
+        };
+        let status = sequence.status();
+        assert!(status.active);
+        assert_eq!((status.total, status.position, status.remaining), (3, 1, 2));
+        assert_eq!(status.current_title.as_deref(), Some("第一条"));
+        sequence.next = 3;
+        let status = sequence.status();
+        assert!(!status.active);
+        assert_eq!((status.position, status.remaining), (3, 0));
+        assert_eq!(status.current_title.as_deref(), Some("第三条"));
+    }
+    #[test]
+    fn sequence_entries_reject_invalid_selection_and_dedupe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("history.sqlite3")).unwrap();
+        let a = store
+            .capture(
+                &store::Capture::text("序列甲".into()).unwrap(),
+                store::now(),
+            )
+            .unwrap();
+        let b = store
+            .capture(
+                &store::Capture::text("序列乙".into()).unwrap(),
+                store::now() + 1,
+            )
+            .unwrap();
+        let entries = sequence_entries(&store, &[a, b, a]).unwrap();
+        assert_eq!(
+            entries,
+            vec![(a, "序列甲".to_string()), (b, "序列乙".to_string())]
+        );
+        assert!(sequence_entries(&store, &[]).is_err());
+        assert!(sequence_entries(&store, &vec![a; 201]).is_err());
+        store
+            .update(
+                b,
+                ItemPatch {
+                    deleted: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(sequence_entries(&store, &[a, b]).is_err());
     }
     #[test]
     fn dto_and_patch_contract() {

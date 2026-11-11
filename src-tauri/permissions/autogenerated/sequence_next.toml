@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sequence-next"
+description = "Enables the sequence_next command without any pre-configured scope."
+commands.allow = ["sequence_next"]
+
+[[permission]]
+identifier = "deny-sequence-next"
+description = "Denies the sequence_next command without any pre-configured scope."
+commands.deny = ["sequence_next"]

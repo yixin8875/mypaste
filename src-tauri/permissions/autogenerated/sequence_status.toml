@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sequence-status"
+description = "Enables the sequence_status command without any pre-configured scope."
+commands.allow = ["sequence_status"]
+
+[[permission]]
+identifier = "deny-sequence-status"
+description = "Denies the sequence_status command without any pre-configured scope."
+commands.deny = ["sequence_status"]

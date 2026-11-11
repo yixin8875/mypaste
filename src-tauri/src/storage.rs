@@ -7,6 +7,19 @@ use std::{
 pub type Result<T> = std::result::Result<T, String>;
 const FILE: &str = "storage.json";
 const DB: &str = "history.sqlite3";
+/// Presence of this file next to the executable selects portable mode.
+pub const PORTABLE_MARKER: &str = "portable.txt";
+/// Portable builds keep their database beside the executable and ignore storage.json.
+pub fn portable_data_dir(exe_dir: &Path) -> Option<PathBuf> {
+    exe_dir
+        .join(PORTABLE_MARKER)
+        .is_file()
+        .then(|| exe_dir.join("data"))
+}
+pub fn current_portable_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    portable_data_dir(exe.parent()?)
+}
 
 /// Persisted choice of data directory. `pendingDir` is set before a restart and
 /// consumed at the next startup, when the database is not open and can be moved.
@@ -123,6 +136,15 @@ fn migrate(from: &Path, target: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn portable_marker_selects_the_executable_directory() {
+        let dir = tempdir().unwrap();
+        assert_eq!(portable_data_dir(dir.path()), None);
+        std::fs::write(dir.path().join(PORTABLE_MARKER), b"").unwrap();
+        assert_eq!(portable_data_dir(dir.path()), Some(dir.path().join("data")));
+        std::fs::create_dir(dir.path().join("portable.txt.dir")).unwrap();
+        assert_eq!(portable_data_dir(dir.path()), Some(dir.path().join("data")));
+    }
     #[test]
     fn config_round_trips_and_defaults() {
         let dir = tempdir().unwrap();

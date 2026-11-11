@@ -3,7 +3,7 @@ import React, { act, StrictMode, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Clip, Snapshot } from './clipboard-service'
-const { api } = vi.hoisted(() => ({ api: { snapshot: vi.fn(), item: vi.fn(), search: vi.fn(), update: vi.fn(), purge: vi.fn(), createCollection: vi.fn(), settings: vi.fn(), copy: vi.fn(), paste: vi.fn(), image: vi.fn(), thumbnail: vi.fn(), version: vi.fn(), checkUpdate: vi.fn(), installUpdate: vi.fn(), openLink: vi.fn(), hideQuick: vi.fn(), subscribe: vi.fn(), updateMany: vi.fn(), addToCollection: vi.fn(), renameCollection: vi.fn(), deleteCollection: vi.fn(), moveCollection: vi.fn(), copyVariant: vi.fn(), copyFormat: vi.fn(), dataUsage: vi.fn(), compactDatabase: vi.fn(), setAutostart: vi.fn() } }))
+const { api } = vi.hoisted(() => ({ api: { snapshot: vi.fn(), item: vi.fn(), search: vi.fn(), update: vi.fn(), purge: vi.fn(), createCollection: vi.fn(), settings: vi.fn(), copy: vi.fn(), paste: vi.fn(), image: vi.fn(), thumbnail: vi.fn(), version: vi.fn(), checkUpdate: vi.fn(), installUpdate: vi.fn(), openLink: vi.fn(), hideQuick: vi.fn(), subscribe: vi.fn(), updateMany: vi.fn(), addToCollection: vi.fn(), renameCollection: vi.fn(), deleteCollection: vi.fn(), moveCollection: vi.fn(), copyVariant: vi.fn(), copyFormat: vi.fn(), dataUsage: vi.fn(), compactDatabase: vi.fn(), setAutostart: vi.fn(), setCollectionPolicy: vi.fn(), startSequence: vi.fn(), sequenceNext: vi.fn(), stopSequence: vi.fn(), logInfo: vi.fn(), openLogDir: vi.fn(), exportDiagnostics: vi.fn(), restartElevated: vi.fn() } }))
 vi.mock('./clipboard-service', () => ({ clipboardService: api, native: true, errorMessage: (e: unknown) => e instanceof Error ? e.message : String(e) }))
 import App, { Editable } from './App'
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
@@ -23,11 +23,13 @@ const openQuick = async () => { await act(async () => { quickOpen(); await settl
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r }); return { promise, resolve } }
 beforeEach(() => {
   vi.resetAllMocks()
-  data = { items: [{ ...clip, content: fullText.slice(0, 240) }], collections: [], settings: { paused: false, retentionDays: 30, maxItems: 500, shortcut: 'Ctrl+Shift+V', excludedApps: [] }, status: { captureState: 'running', captureError: null, shortcutRegistered: true, shortcutError: null, autostart: false }, dataDir: 'C:/synthetic-test-data', storageError: null }
+  data = { items: [{ ...clip, content: fullText.slice(0, 240) }], collections: [], collectionPolicies: [], settings: { paused: false, retentionDays: 30, maxItems: 500, shortcut: 'Ctrl+Shift+V', excludedApps: [] }, sequence: { active: false, total: 0, position: 0, currentTitle: null, remaining: 0 }, status: { captureState: 'running', captureError: null, shortcutRegistered: true, shortcutError: null, autostart: false, elevated: false, portable: false }, dataDir: 'C:/synthetic-test-data', storageError: null }
   api.snapshot.mockImplementation(async () => structuredClone(data)); api.item.mockImplementation(async () => ({ ...clip })); api.search.mockResolvedValue([1])
   api.subscribe.mockImplementation(async (change, quick) => { changed = change; quickOpen = quick; return vi.fn() })
   api.update.mockResolvedValue(undefined); api.copy.mockResolvedValue(undefined); api.image.mockResolvedValue(''); api.thumbnail.mockResolvedValue(''); api.hideQuick.mockResolvedValue(undefined); api.settings.mockResolvedValue(undefined)
   api.version.mockResolvedValue('0.2.0'); api.checkUpdate.mockResolvedValue(null); api.installUpdate.mockResolvedValue(undefined)
+  api.dataUsage.mockResolvedValue({ bytes: 0, items: 1, trashed: 0 }); api.compactDatabase.mockResolvedValue({ bytes: 0, items: 1, trashed: 0 })
+  api.setCollectionPolicy.mockResolvedValue(undefined); api.sequenceNext.mockResolvedValue({ active: false, total: 0, position: 0, currentTitle: null, remaining: 0 }); api.stopSequence.mockResolvedValue({ active: false, total: 0, position: 0, currentTitle: null, remaining: 0 }); api.logInfo.mockResolvedValue({ dir: 'C:/synthetic-test-data/logs', file: 'C:/synthetic-test-data/logs/mypaste.log', bytes: 2048 }); api.openLogDir.mockResolvedValue(undefined); api.exportDiagnostics.mockResolvedValue('C:/synthetic-test-data/diagnostics.txt'); api.restartElevated.mockResolvedValue(undefined)
   Element.prototype.scrollIntoView = vi.fn()
   host = document.createElement('div'); document.body.append(host); root = createRoot(host)
 })
@@ -225,6 +227,57 @@ describe('原生适配异步交互', () => {
     await click('[aria-label="开机自动启动"]')
     expect(api.setAutostart).toHaveBeenCalledWith(true)
     expect(host.querySelector('[role="status"]')?.textContent).toContain('已开启开机启动')
+  })
+  it('多选后开始序列粘贴，可推进与结束', async () => {
+    data.items = [{ ...clip, id: 1, title: '第一条' }, { ...clip, id: 2, title: '第二条' }]
+    api.item.mockImplementation(async (id: number) => data.items.find(c => c.id === id)!)
+    api.startSequence.mockResolvedValue({ active: true, total: 2, position: 1, currentTitle: '第一条', remaining: 1 })
+    await render(<App/>)
+    const rows = host.querySelectorAll<HTMLButtonElement>('.clip-row')
+    await act(async () => { rows[0].dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: true })); await settle() })
+    await act(async () => { rows[1].dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: true })); await settle() })
+    await clickText('.bulk-actions button', '序列粘贴')
+    expect(api.startSequence).toHaveBeenCalledWith([1, 2])
+    expect(host.querySelector('[role="status"]')?.textContent).toContain('序列粘贴已开始')
+    expect(host.querySelector('.bulk-bar')).toBeNull()
+    data.sequence = { active: true, total: 2, position: 1, currentTitle: '第一条', remaining: 1 }
+    await act(async () => { changed(); await settle() })
+    expect(host.querySelector('.sequence-bar')?.textContent).toContain('序列粘贴 1/2')
+    await clickText('.sequence-actions button', '下一项')
+    expect(api.sequenceNext).toHaveBeenCalledTimes(1)
+    await clickText('.sequence-actions button', '结束')
+    expect(api.stopSequence).toHaveBeenCalledTimes(1)
+  })
+  it('集合管理可分别设置保留时间与条数上限', async () => {
+    data.collections = ['素材']
+    api.setCollectionPolicy.mockImplementation(async (name: string, retentionDays: number | null, maxItems: number | null) => {
+      data.collectionPolicies = [{ name, retentionDays, maxItems }]
+    })
+    await render(<App/>)
+    await click('[aria-label="管理集合"]')
+    await choose(host.querySelector<HTMLSelectElement>('[aria-label="素材 保留时间"]')!, '90')
+    expect(api.setCollectionPolicy).toHaveBeenCalledWith('素材', 90, null)
+    await choose(host.querySelector<HTMLSelectElement>('[aria-label="素材 条数上限"]')!, '1000')
+    expect(api.setCollectionPolicy).toHaveBeenCalledWith('素材', 90, 1000)
+    expect(host.querySelector('[role="status"]')?.textContent).toContain('已更新「素材」的保留策略')
+  })
+  it('设置页展示诊断日志并可导出，管理员重启需确认', async () => {
+    await render(<App/>)
+    await click('header [aria-label="设置"]')
+    await clickText('.settings-tabs button', '数据')
+    expect(api.logInfo).toHaveBeenCalled()
+    expect(host.textContent).toContain('C:/synthetic-test-data/logs/mypaste.log')
+    await clickText('.setting-row button', '打开日志目录')
+    expect(api.openLogDir).toHaveBeenCalledTimes(1)
+    await clickText('.setting-row button', '导出诊断信息')
+    expect(api.exportDiagnostics).toHaveBeenCalledTimes(1)
+    expect(host.querySelector('[role="status"]')?.textContent).toContain('诊断信息已导出')
+    await clickText('.settings-tabs button', '通用')
+    await clickText('.settings-modal button', '以管理员身份重启')
+    expect(host.querySelector('[role="dialog"][aria-label="以管理员身份重启？"]')).not.toBeNull()
+    expect(api.restartElevated).not.toHaveBeenCalled()
+    await clickText('.modal-actions button', '重启并提权')
+    expect(api.restartElevated).toHaveBeenCalledTimes(1)
   })
 })
 describe('编辑草稿', () => {

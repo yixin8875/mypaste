@@ -2,6 +2,7 @@ use chrono::{Local, TimeZone};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -60,6 +61,14 @@ pub struct FileEntry {
     pub size: Option<i64>,
     pub modified_at: Option<i64>,
     pub is_dir: bool,
+}
+/// Optional per-collection retention override. `None` follows the global setting.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionPolicy {
+    pub name: String,
+    pub retention_days: Option<i64>,
+    pub max_items: Option<i64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -449,7 +458,7 @@ impl Store {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(db)?;
-        if version > 7 {
+        if version > 8 {
             return Err("Database schema is newer than this application".into());
         }
         if version == 0 {
@@ -560,6 +569,17 @@ impl Store {
             )
             .map_err(db)?;
         }
+        // v8: per-collection retention overrides; NULL keeps following the global setting.
+        if current < 8 {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE collections ADD COLUMN retention_days INTEGER CHECK(retention_days IS NULL OR (retention_days BETWEEN 1 AND 3650));
+                 ALTER TABLE collections ADD COLUMN max_items INTEGER CHECK(max_items IS NULL OR (max_items BETWEEN 1 AND 100000));
+                 PRAGMA user_version=8;
+                 COMMIT;",
+            )
+            .map_err(db)?;
+        }
         let saved: Option<String> = conn
             .query_row("SELECT value FROM settings WHERE key='settings'", [], |r| {
                 r.get(0)
@@ -649,6 +669,48 @@ impl Store {
             .map_err(db)?;
         let rows = stmt.query_map([], |r| r.get(0)).map_err(db)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)
+    }
+    pub fn collection_policies(&self) -> Result<Vec<CollectionPolicy>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT name,retention_days,max_items FROM collections ORDER BY position,name COLLATE NOCASE",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(CollectionPolicy {
+                    name: r.get(0)?,
+                    retention_days: r.get(1)?,
+                    max_items: r.get(2)?,
+                })
+            })
+            .map_err(db)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)
+    }
+    /// Replace one collection's retention override. `None` clears it back to the global policy.
+    pub fn set_collection_policy(
+        &mut self,
+        name: &str,
+        retention_days: Option<i64>,
+        max_items: Option<i64>,
+    ) -> Result<()> {
+        if retention_days.is_some_and(|days| !(1..=3650).contains(&days))
+            || max_items.is_some_and(|max| !(1..=100_000).contains(&max))
+        {
+            return Err("集合保留策略超出允许范围".into());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE collections SET retention_days=?2,max_items=?3 WHERE name=?1",
+                params![name, retention_days, max_items],
+            )
+            .map_err(db)?;
+        if changed == 0 {
+            return Err("Collection not found".into());
+        }
+        Ok(())
     }
     fn collection_name(name: &str) -> Result<&str> {
         let name = name.trim();
@@ -971,7 +1033,7 @@ impl Store {
                 .conn
                 .query_row("PRAGMA backup.user_version", [], |r| r.get(0))
                 .map_err(db)?;
-            if !(4..=7).contains(&version) {
+            if !(4..=8).contains(&version) {
                 return Err("备份文件的数据库版本不受支持".into());
             }
             let integrity: String = self
@@ -996,8 +1058,13 @@ impl Store {
             )
             .map_err(db)?;
             let position = if version >= 6 { "position" } else { "0" };
+            let policy = if version >= 8 {
+                "retention_days,max_items"
+            } else {
+                "NULL,NULL"
+            };
             tx.execute(
-                &format!("INSERT INTO collections(name,position) SELECT name,{position} FROM backup.collections"),
+                &format!("INSERT INTO collections(name,position,retention_days,max_items) SELECT name,{position},{policy} FROM backup.collections"),
                 [],
             )
             .map_err(db)?;
@@ -1055,6 +1122,15 @@ impl Store {
             None => old.deleted_at,
         };
         if old.deleted && p.deleted == Some(false) && !old.favorite {
+            // A collection with its own policy is judged by that policy when the next
+            // maintenance runs; only records outside such collections are pre-checked.
+            let managed: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM members m JOIN collections c ON c.name=m.name WHERE m.item_id=?1 AND (c.retention_days IS NOT NULL OR c.max_items IS NOT NULL))",
+                    [id],
+                    |r| r.get(0),
+                )
+                .map_err(db)?;
             let count: i64 = tx
                 .query_row(
                     "SELECT count(*) FROM items WHERE favorite=0 AND pinned=0 AND deleted_at IS NULL",
@@ -1062,8 +1138,9 @@ impl Store {
                     |r| r.get(0),
                 )
                 .map_err(db)?;
-            if old.captured_at <= now() - self.settings.retention_days * DAY
-                || count >= self.settings.max_items
+            if !managed
+                && (old.captured_at <= now() - self.settings.retention_days * DAY
+                    || count >= self.settings.max_items)
             {
                 return Err("Item exceeds retention limits; it remains in trash".into());
             }
@@ -1211,10 +1288,103 @@ impl Store {
             .map_err(db)?;
         Ok(())
     }
+    /// Soft-delete records past the time or count policy, then purge the 7-day trash.
+    ///
+    /// A collection with any retention override manages its own members: time uses the
+    /// longer of its override and the global value, and count uses its override or the
+    /// global value applied within the collection. An item in several managed
+    /// collections is kept while any of them keeps it; items in no managed collection
+    /// follow the global policies.
     pub fn maintain(&mut self, at: i64) -> Result<bool> {
+        let policies = self.collection_policies()?;
+        let mut by_name: HashMap<&str, (Option<i64>, Option<i64>)> = HashMap::new();
+        for policy in &policies {
+            by_name.insert(
+                policy.name.as_str(),
+                (policy.retention_days, policy.max_items),
+            );
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id,captured_at FROM items WHERE favorite=0 AND pinned=0 AND deleted_at IS NULL ORDER BY captured_at DESC,id DESC")
+            .map_err(db)?;
+        let items = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?;
+        drop(stmt);
+        let mut members: HashMap<i64, Vec<String>> = HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT item_id,name FROM members")
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db)?;
+        for row in rows {
+            let (id, name) = row.map_err(db)?;
+            members.entry(id).or_default().push(name);
+        }
+        drop(stmt);
+        let names_of =
+            |id: i64| -> &[String] { members.get(&id).map(Vec::as_slice).unwrap_or(&[]) };
+        let mut expire: HashSet<i64> = HashSet::new();
+        for (id, captured) in &items {
+            let longest = names_of(*id)
+                .iter()
+                .filter_map(|name| by_name.get(name.as_str()).and_then(|p| p.0))
+                .max();
+            let days = longest
+                .map(|days| days.max(self.settings.retention_days))
+                .unwrap_or(self.settings.retention_days);
+            if *captured <= at - days * DAY {
+                expire.insert(*id);
+            }
+        }
+        let managed: HashSet<&str> = policies
+            .iter()
+            .filter(|policy| policy.retention_days.is_some() || policy.max_items.is_some())
+            .map(|policy| policy.name.as_str())
+            .collect();
+        let mut protected: HashSet<i64> = HashSet::new();
+        for policy in policies
+            .iter()
+            .filter(|p| managed.contains(p.name.as_str()))
+        {
+            let max = policy.max_items.unwrap_or(self.settings.max_items).max(0) as usize;
+            let members_of_collection = items
+                .iter()
+                .filter(|(id, _)| names_of(*id).iter().any(|name| name == &policy.name))
+                .take(max);
+            for (id, _) in members_of_collection {
+                protected.insert(*id);
+            }
+        }
+        let mut ranked = 0i64;
+        for (id, _) in &items {
+            let overridden = names_of(*id)
+                .iter()
+                .any(|name| managed.contains(name.as_str()));
+            if overridden {
+                // Governed by its collections; expire only when no collection keeps it.
+                if !protected.contains(id) {
+                    expire.insert(*id);
+                }
+            } else if ranked >= self.settings.max_items {
+                expire.insert(*id);
+            } else {
+                ranked += 1;
+            }
+        }
         let tx = self.conn.transaction().map_err(db)?;
-        let a=tx.execute("UPDATE items SET deleted_at=?1 WHERE favorite=0 AND pinned=0 AND deleted_at IS NULL AND captured_at<=?2",params![at,at-self.settings.retention_days*DAY]).map_err(db)?;
-        let b=tx.execute("UPDATE items SET deleted_at=?1 WHERE id IN(SELECT id FROM items WHERE favorite=0 AND pinned=0 AND deleted_at IS NULL ORDER BY captured_at DESC,id DESC LIMIT -1 OFFSET ?2)",params![at,self.settings.max_items]).map_err(db)?;
+        for id in &expire {
+            tx.execute(
+                "UPDATE items SET deleted_at=?1 WHERE id=?2 AND deleted_at IS NULL",
+                params![at, id],
+            )
+            .map_err(db)?;
+        }
         let c = tx
             .execute(
                 "DELETE FROM items WHERE deleted_at IS NOT NULL AND deleted_at<=?1",
@@ -1222,7 +1392,7 @@ impl Store {
             )
             .map_err(db)?;
         tx.commit().map_err(db)?;
-        Ok(a + b + c > 0)
+        Ok(!expire.is_empty() || c > 0)
     }
 }
 
@@ -1308,13 +1478,21 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let old = store.get(1).unwrap();
         assert_eq!(old.title, "旧记录");
         assert_eq!(old.source, "未知来源");
         assert_eq!(old.use_count, 0);
         assert!(old.last_used_at.is_none());
         assert_eq!(store.collections().unwrap(), vec!["旧集合"]);
+        assert_eq!(
+            store.collection_policies().unwrap()[0],
+            CollectionPolicy {
+                name: "旧集合".into(),
+                retention_days: None,
+                max_items: None,
+            }
+        );
         let id = store
             .capture(
                 &Capture::files(vec![file(
@@ -1341,7 +1519,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let old = store.get(1).unwrap();
         assert_eq!(old.file_size, 0);
         assert!(old.files.is_empty());
@@ -1373,7 +1551,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let old = store.get(1).unwrap();
         assert_eq!(old.source, "未知来源");
         assert_eq!(old.use_count, 0);
@@ -1637,6 +1815,119 @@ mod tests {
         assert!(s.get(a).is_err());
     }
     #[test]
+    fn collection_policy_extends_time_and_scopes_counts() {
+        let mut s = memory();
+        let at = now();
+        s.settings.retention_days = 30;
+        s.settings.max_items = 10;
+        s.create_collection("长期").unwrap();
+        s.set_collection_policy("长期", Some(90), None).unwrap();
+        s.create_collection("短期").unwrap();
+        s.set_collection_policy("短期", Some(7), None).unwrap();
+        let long = s.capture(&text("synthetic long"), at - 40 * DAY).unwrap();
+        s.update(
+            long,
+            ItemPatch {
+                collections: Some(vec!["长期".into(), "短期".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let plain = s.capture(&text("synthetic plain"), at - 40 * DAY).unwrap();
+        s.maintain(at).unwrap();
+        assert!(
+            !s.get(long).unwrap().deleted,
+            "90 天集合保护超过 40 天的记录"
+        );
+        assert!(
+            s.get(plain).unwrap().deleted,
+            "未加入集合的记录按全局 30 天清理"
+        );
+
+        let mut s = memory();
+        s.settings.max_items = 10;
+        s.create_collection("保留两条").unwrap();
+        s.set_collection_policy("保留两条", None, Some(2)).unwrap();
+        let a = s.capture(&text("a synthetic"), at).unwrap();
+        let b = s.capture(&text("b synthetic"), at + 1).unwrap();
+        let c = s.capture(&text("c synthetic"), at + 2).unwrap();
+        let d = s.capture(&text("d synthetic"), at + 3).unwrap();
+        for id in [a, b, d] {
+            s.update(
+                id,
+                ItemPatch {
+                    collections: Some(vec!["保留两条".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        s.settings.max_items = 1;
+        s.maintain(at + 4).unwrap();
+        assert!(s.get(a).unwrap().deleted, "集合只保留最新两条");
+        assert!(!s.get(b).unwrap().deleted);
+        assert!(!s.get(d).unwrap().deleted);
+        assert!(!s.get(c).unwrap().deleted, "集合外记录仍享有全局 1 条名额");
+    }
+    #[test]
+    fn favorites_are_exempt_from_collection_limits() {
+        let mut s = memory();
+        let at = now();
+        s.settings.max_items = 1;
+        s.create_collection("合成收藏").unwrap();
+        s.set_collection_policy("合成收藏", None, Some(1)).unwrap();
+        let older = s.capture(&text("older synthetic"), at).unwrap();
+        s.update(
+            older,
+            ItemPatch {
+                favorite: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let newer = s.capture(&text("newer synthetic"), at + 1).unwrap();
+        for id in [older, newer] {
+            s.update(
+                id,
+                ItemPatch {
+                    collections: Some(vec!["合成收藏".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        s.maintain(at + 2).unwrap();
+        assert!(!s.get(older).unwrap().deleted, "收藏豁免集合条数上限");
+        assert!(!s.get(newer).unwrap().deleted, "集合上限内最新一条保留");
+    }
+    #[test]
+    fn collection_policy_validation_and_defaults() {
+        let mut s = memory();
+        s.create_collection("合成集合").unwrap();
+        assert_eq!(
+            s.collection_policies().unwrap(),
+            vec![CollectionPolicy {
+                name: "合成集合".into(),
+                retention_days: None,
+                max_items: None,
+            }]
+        );
+        assert!(s.set_collection_policy("missing", Some(7), None).is_err());
+        assert!(s.set_collection_policy("合成集合", Some(0), None).is_err());
+        assert!(s
+            .set_collection_policy("合成集合", Some(3651), None)
+            .is_err());
+        assert!(s.set_collection_policy("合成集合", None, Some(0)).is_err());
+        assert!(s
+            .set_collection_policy("合成集合", None, Some(100_001))
+            .is_err());
+        s.set_collection_policy("合成集合", Some(90), Some(1000))
+            .unwrap();
+        assert_eq!(s.collection_policies().unwrap()[0].retention_days, Some(90));
+        s.set_collection_policy("合成集合", None, None).unwrap();
+        assert_eq!(s.collection_policies().unwrap()[0].max_items, None);
+    }
+    #[test]
     fn validation_and_atomic_collection_patch() {
         let mut s = memory();
         let id = s.capture(&text("valid"), now()).unwrap();
@@ -1842,6 +2133,8 @@ mod tests {
         let at = now();
         let id = s.capture(&text("backup synthetic body"), at).unwrap();
         s.create_collection("BackupKit").unwrap();
+        s.set_collection_policy("BackupKit", Some(90), Some(1000))
+            .unwrap();
         s.update(
             id,
             ItemPatch {
@@ -1865,6 +2158,14 @@ mod tests {
         assert!(got.favorite && got.pinned);
         assert_eq!(got.note, "keep me");
         assert_eq!(got.collections, vec!["BackupKit"]);
+        assert_eq!(
+            fresh.collection_policies().unwrap()[0],
+            CollectionPolicy {
+                name: "BackupKit".into(),
+                retention_days: Some(90),
+                max_items: Some(1000),
+            }
+        );
         assert_eq!(fresh.search("synthetic body").unwrap(), vec![id]);
     }
     #[test]

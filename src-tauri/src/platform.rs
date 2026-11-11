@@ -21,7 +21,7 @@ mod win {
             MONITOR_DEFAULTTONEAREST,
         },
         System::{DataExchange::*, LibraryLoader::GetModuleHandleW, Memory::*, Threading::*},
-        UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+        UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     };
     static NOTIFY: Mutex<Option<SyncSender<u32>>> = Mutex::new(None);
     static OWNER: AtomicIsize = AtomicIsize::new(0);
@@ -790,6 +790,37 @@ mod win {
             .and_then(|key| key.get_value::<String, _>(RUN_VALUE))
             .is_ok()
     }
+    /// Best-effort elevation check used only for display; it does not grant anything.
+    pub fn elevated() -> bool {
+        unsafe { IsUserAnAdmin() != 0 }
+    }
+    /// Ask Windows to start another copy of this executable through the UAC prompt.
+    /// The caller exits on success; a cancelled prompt leaves the current process running.
+    pub fn restart_elevated() -> Result<()> {
+        let exe = std::env::current_exe().map_err(|e| format!("无法读取程序路径：{e}"))?;
+        let operation: Vec<u16> = "runas\0".encode_utf16().collect();
+        let file: Vec<u16> = exe
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let result = unsafe {
+            ShellExecuteW(
+                null_mut(),
+                operation.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if result as isize <= 32 {
+            return Err(
+                "无法以管理员身份启动；请在系统提示中确认，或手动右键以管理员身份运行。".into(),
+            );
+        }
+        Ok(())
+    }
     pub fn set_autostart(enabled: bool) -> Result<()> {
         use winreg::{
             enums::{HKEY_CURRENT_USER, KEY_SET_VALUE},
@@ -813,8 +844,9 @@ mod win {
 }
 #[cfg(windows)]
 pub use win::{
-    autostart_enabled, copy, copy_files, copy_formats, foreground, listen, owns_clipboard, paste,
-    read, sequence, set_autostart, source_app, stop, work_area,
+    autostart_enabled, copy, copy_files, copy_formats, elevated, foreground, listen,
+    owns_clipboard, paste, read, restart_elevated, sequence, set_autostart, source_app, stop,
+    work_area,
 };
 #[cfg(not(windows))]
 pub fn owns_clipboard() -> bool {
@@ -835,6 +867,14 @@ pub fn work_area(_: isize) -> Option<(i32, i32, i32, i32)> {
 #[cfg(not(windows))]
 pub fn autostart_enabled() -> bool {
     false
+}
+#[cfg(not(windows))]
+pub fn elevated() -> bool {
+    false
+}
+#[cfg(not(windows))]
+pub fn restart_elevated() -> Result<()> {
+    Err("管理员启动目前仅支持 Windows".into())
 }
 #[cfg(not(windows))]
 pub fn set_autostart(_: bool) -> Result<()> {

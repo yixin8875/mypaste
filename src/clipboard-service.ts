@@ -12,11 +12,14 @@ export type Clip = {
   lastUsedAt: number | null; useCount: number; hasHtml: boolean; hasRtf: boolean
 }
 export type Settings = { paused: boolean; retentionDays: number; maxItems: number; shortcut: string; excludedApps: string[] }
-export type RuntimeStatus = { captureState: 'running' | 'paused' | 'error'; captureError: string | null; shortcutRegistered: boolean; shortcutError: string | null; autostart: boolean }
+export type CollectionPolicy = { name: string; retentionDays: number | null; maxItems: number | null }
+export type SequenceStatus = { active: boolean; total: number; position: number; currentTitle: string | null; remaining: number }
+export type LogInfo = { dir: string; file: string; bytes: number }
+export type RuntimeStatus = { captureState: 'running' | 'paused' | 'error'; captureError: string | null; shortcutRegistered: boolean; shortcutError: string | null; autostart: boolean; elevated: boolean; portable: boolean }
 export type DbUsage = { bytes: number; items: number; trashed: number }
 export type CopyMode = 'plain' | 'trim' | 'one_line'
 export type RichFormat = 'html' | 'rtf'
-export type Snapshot = { items: Clip[]; collections: string[]; settings: Settings; status: RuntimeStatus; dataDir: string; storageError: string | null }
+export type Snapshot = { items: Clip[]; collections: string[]; collectionPolicies: CollectionPolicy[]; settings: Settings; sequence: SequenceStatus; status: RuntimeStatus; dataDir: string; storageError: string | null }
 export type ClipPatch = Partial<Pick<Clip, 'title' | 'note' | 'favorite' | 'pinned' | 'collections' | 'deleted'>>
 export type PasteOutcome = { copied: boolean; status: 'input_sent' | 'manual_required' | 'clipboard_failed'; reason: string | null }
 export type UpdateCheck = { version: string; currentVersion: string; notes: string; date: string | null }
@@ -49,8 +52,19 @@ const demo: Snapshot = {
     return { id: i + 1, title, content, type, source, favorite, pinned: i === 0 || i === 6, collections: collection ? [collection] : [], note: '', capturedAt, day: i < 6 ? '今天' : '昨天', time: new Date(capturedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }), deleted: i === 9, deletedAt: i === 9 ? now : null, fileSize, fileModifiedAt, files, lastUsedAt: useCount ? capturedAt + 60000 : null, useCount, hasHtml: i === 0 || i === 4 || i === 6, hasRtf: i === 0 }
   }),
   collections: ['日常工作', '开发片段', '灵感收集'],
+  collectionPolicies: [],
   settings: { paused: false, retentionDays: 30, maxItems: 500, shortcut: 'Ctrl+Shift+V', excludedApps: [] },
-  status: { captureState: 'running', captureError: null, shortcutRegistered: false, shortcutError: null, autostart: false }, dataDir: '', storageError: null,
+  sequence: { active: false, total: 0, position: 0, currentTitle: null, remaining: 0 },
+  status: { captureState: 'running', captureError: null, shortcutRegistered: false, shortcutError: null, autostart: false, elevated: false, portable: false }, dataDir: '', storageError: null,
+}
+type DemoSequence = { ids: number[]; next: number }
+let demoSequence: DemoSequence | null = null
+const idleSequence = (): SequenceStatus => ({ active: false, total: 0, position: 0, currentTitle: null, remaining: 0 })
+function demoSequenceStatus(): SequenceStatus {
+  if(!demoSequence) return idleSequence()
+  const total = demoSequence.ids.length, position = demoSequence.next
+  const current = demo.items.find(c => c.id === demoSequence!.ids[position - 1])
+  return { active: position < total, total, position, currentTitle: current?.title ?? null, remaining: total - position }
 }
 let pendingUpdate: Update | null = null
 const listeners = new Set<() => void>()
@@ -69,7 +83,7 @@ function markDemoUsed(item: Clip) {
   item.useCount += 1
 }
 export const clipboardService = {
-  async snapshot(): Promise<Snapshot> { return native ? invoke('get_snapshot') : structuredClone(demo) },
+  async snapshot(): Promise<Snapshot> { return native ? invoke('get_snapshot') : { ...structuredClone(demo), sequence: demoSequenceStatus() } },
   async item(id: number): Promise<Clip> { return native ? invoke('get_item', { id }) : structuredClone(demoItem(id)) },
   async search(query: string): Promise<number[]> {
     if(native) return invoke('search_items', { query })
@@ -122,6 +136,55 @@ export const clipboardService = {
     if(index < 0 || other < 0 || other >= demo.collections.length) return
     ;[demo.collections[index], demo.collections[other]] = [demo.collections[other], demo.collections[index]]
     notify()
+  },
+  async setCollectionPolicy(name: string, retentionDays: number | null, maxItems: number | null): Promise<void> {
+    if(native) return invoke('set_collection_policy', { name, retentionDays, maxItems })
+    const existing = demo.collectionPolicies.find(policy => policy.name === name)
+    if(existing) Object.assign(existing, { retentionDays, maxItems })
+    else demo.collectionPolicies.push({ name, retentionDays, maxItems })
+    notify()
+  },
+  async startSequence(ids: number[]): Promise<SequenceStatus> {
+    if(native) return invoke('start_sequence', { ids })
+    if(!ids.length) throw new Error('请至少选择一条记录')
+    const entries = [...new Set(ids)].map(demoItem).filter(item => !item.deleted)
+    if(!entries.length) throw new Error('请先恢复最近删除中的记录，再开始序列粘贴')
+    markDemoUsed(entries[0])
+    demoSequence = { ids: entries.map(item => item.id), next: 1 }
+    notify()
+    return demoSequenceStatus()
+  },
+  async sequenceNext(): Promise<SequenceStatus> {
+    if(native) return invoke('sequence_next')
+    if(!demoSequence) throw new Error('没有进行中的序列粘贴')
+    const current = demo.items.find(item => item.id === demoSequence!.ids[demoSequence!.next])
+    if(current && !current.deleted) markDemoUsed(current)
+    demoSequence.next += 1
+    const status = demoSequenceStatus()
+    if(!status.active) demoSequence = null
+    notify()
+    return status
+  },
+  async stopSequence(): Promise<SequenceStatus> {
+    if(native) return invoke('stop_sequence')
+    demoSequence = null; notify(); return idleSequence()
+  },
+  async logInfo(): Promise<LogInfo> {
+    if(native) return invoke('get_log_info')
+    return { dir: '', file: '', bytes: 0 }
+  },
+  async openLogDir(): Promise<void> { if(native) await invoke('open_log_dir') },
+  async exportDiagnostics(): Promise<string | null> {
+    if(!native) throw new Error('浏览器演示不支持导出诊断信息')
+    const { save } = await import('@tauri-apps/plugin-dialog')
+    const path = await save({ title: '导出诊断信息', defaultPath: `MyPaste-diagnostics-${new Date().toISOString().slice(0, 10)}.txt`, filters: [{ name: '诊断信息', extensions: ['txt'] }] })
+    if(!path) return null
+    await invoke('export_diagnostics', { path })
+    return path
+  },
+  async restartElevated(): Promise<void> {
+    if(native) return invoke('restart_elevated')
+    throw new Error('浏览器演示不支持管理员启动')
   },
   async copyVariant(id: number, mode: CopyMode): Promise<void> {
     if(native) return invoke('copy_item_variant', { id, mode })
@@ -262,6 +325,7 @@ export const clipboardService = {
     try {
       unlisten.push(await listen('history://changed', onChange))
       unlisten.push(await listen('capture://status', onChange))
+      unlisten.push(await listen('sequence://changed', onChange))
       unlisten.push(await listen('desktop://quick-open', onQuickOpen))
     } catch(error) { unlisten.forEach(fn => fn()); throw error }
     return () => unlisten.forEach(fn => fn())

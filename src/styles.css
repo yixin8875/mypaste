@@ -37,6 +37,16 @@
 .bulk-actions .text-button:hover{background:#e6f0fe}
 .text-button.danger{color:#c84545}
 .bulk-actions .text-button.danger:hover{background:#ffecec}
+.sequence-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:space-between;margin:2px 18px 8px;padding:9px 11px;border:1px solid #cfe0f7;background:linear-gradient(180deg,#f5faff,#eef6ff);border-radius:7px;color:#33587f}
+.sequence-info{display:flex;align-items:center;gap:9px;min-width:0}
+.sequence-info>svg{flex:0 0 auto;color:#3f7bc4}
+.sequence-info div{display:flex;flex-direction:column;gap:2px;min-width:0}
+.sequence-info strong{font-size:11px;font-weight:600}
+.sequence-info span{font-size:9.5px;color:#68829f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sequence-actions{display:flex;align-items:center;gap:4px;flex:0 0 auto}
+.sequence-actions .secondary-button{padding:5px 9px;font-size:10px}
+.sequence-actions .text-button{padding:5px 7px;border-radius:4px;color:#3f669c}
+.sequence-actions .text-button:hover{background:#e1eefd}
 .bulk-collection{display:flex;align-items:center;gap:4px;padding:3px 5px;border-radius:4px;color:#3f669c}
 .bulk-collection:hover{background:#e6f0fe}
 .bulk-collection select{appearance:none;border:0;background:transparent;font-size:10px;color:#3f669c;max-width:92px;cursor:pointer}
@@ -48,7 +58,11 @@
 .copy-menu small{font-size:9px;color:#96a0ad}
 .collection-modal{width:480px}
 .collection-list{display:flex;flex-direction:column;gap:2px;margin-top:4px}
-.collection-row{display:flex;align-items:center;gap:8px;min-height:42px;padding:2px 4px;border-bottom:1px solid #f0f2f6}
+.collection-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:42px;padding:2px 4px;border-bottom:1px solid #f0f2f6}
+.collection-policy{order:3;display:flex;align-items:center;gap:12px;width:100%;padding:2px 0 6px 24px}
+.collection-policy label{display:flex;align-items:center;gap:4px;font-size:9.5px;color:#8b96a5}
+.collection-policy select{appearance:none;border:1px solid #e2e7ee;background:#fbfcfe;border-radius:5px;padding:3px 18px 3px 6px;font-size:9.5px;color:#5b6675}
+.collection-policy svg{margin-left:-16px;pointer-events:none;color:#98a3b2}
 .collection-name{display:flex;align-items:center;gap:8px;flex:1;min-width:0;font-size:12px;color:#4b5665}
 .collection-name svg{color:#8290a3}
 .collection-name small{font-size:9px;color:#9aa3af}

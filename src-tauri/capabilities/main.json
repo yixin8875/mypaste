@@ -15,6 +15,10 @@
     "allow-update-items", "allow-add-to-collection", "allow-copy-item-variant",
     "allow-copy-item-format",
     "allow-data-usage", "allow-compact-database", "allow-set-autostart",
+    "allow-set-collection-policy",
+    "allow-start-sequence", "allow-sequence-status", "allow-sequence-next", "allow-stop-sequence",
+    "allow-get-log-info", "allow-open-log-dir", "allow-export-diagnostics",
+    "allow-restart-elevated",
     "updater:default", "process:allow-restart", "dialog:default"
   ]
 }

@@ -26,6 +26,15 @@ const COMMANDS: &[&str] = &[
     "data_usage",
     "compact_database",
     "set_autostart",
+    "set_collection_policy",
+    "start_sequence",
+    "sequence_status",
+    "sequence_next",
+    "stop_sequence",
+    "get_log_info",
+    "open_log_dir",
+    "export_diagnostics",
+    "restart_elevated",
 ];
 fn main() {
     tauri_build::try_build(

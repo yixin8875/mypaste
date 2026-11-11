@@ -1,0 +1,120 @@
+{
+  "checkedAt": "2026-11-11T05:01:30.335Z",
+  "checks": [
+    {
+      "name": "真实桌面 WebView 使用本地模式",
+      "passed": true
+    },
+    {
+      "name": "普通模式数据目录为本次独立验收目录",
+      "passed": true
+    },
+    {
+      "name": "首次启动没有序列或集合策略",
+      "passed": true
+    },
+    {
+      "name": "普通模式 status.portable 为 false",
+      "passed": true
+    },
+    {
+      "name": "为不存在的集合设置策略被拒绝",
+      "passed": true
+    },
+    {
+      "name": "集合保留时间与条数上限已持久化",
+      "passed": true
+    },
+    {
+      "name": "保留天数为 0 被拒绝",
+      "passed": true
+    },
+    {
+      "name": "保留天数超过上限被拒绝",
+      "passed": true
+    },
+    {
+      "name": "条数上限为 0 被拒绝",
+      "passed": true
+    },
+    {
+      "name": "清空后跟随全局策略",
+      "passed": true
+    },
+    {
+      "name": "日志目录位于数据目录下",
+      "passed": true
+    },
+    {
+      "name": "日志文件名为 mypaste.log",
+      "passed": true
+    },
+    {
+      "name": "诊断文件包含版本与日志目录",
+      "passed": true
+    },
+    {
+      "name": "诊断文件正确标记非便携模式",
+      "passed": true
+    },
+    {
+      "name": "诊断文件不包含集合名或剪贴板正文",
+      "passed": true
+    },
+    {
+      "name": "诊断导出拒绝覆盖当前数据库",
+      "passed": true
+    },
+    {
+      "name": "初始序列状态为空闲",
+      "passed": true
+    },
+    {
+      "name": "无序列时推进返回空闲且不写剪贴板",
+      "passed": true
+    },
+    {
+      "name": "空选择开始序列被拒绝",
+      "passed": true
+    },
+    {
+      "name": "不存在的记录开始序列被拒绝",
+      "passed": true
+    },
+    {
+      "name": "结束序列返回空闲",
+      "passed": true
+    },
+    {
+      "name": "便携模式 status.portable 为 true",
+      "passed": true
+    },
+    {
+      "name": "便携模式数据位于 exe 同目录 data 文件夹",
+      "passed": true
+    },
+    {
+      "name": "便携模式创建了 history.sqlite3",
+      "passed": true
+    },
+    {
+      "name": "便携模式日志位于 data/logs",
+      "passed": true
+    },
+    {
+      "name": "便携模式拒绝更改存储目录",
+      "passed": true
+    },
+    {
+      "name": "便携模式诊断标记 portable: true",
+      "passed": true
+    }
+  ],
+  "clipboardReadOrWriteByTest": false,
+  "skipped": [
+    "序列粘贴的真实剪贴板写入与全局快捷键推进：需真实剪贴板，留给人工验收",
+    "restart_elevated：会触发 UAC 并退出当前进程，留给人工验收",
+    "拖到外部应用：本期未实现，见文档“暂缓项”"
+  ],
+  "note": "隔离数据目录与便携目录上的真实 IPC 验收；不读写真实剪贴板，不替代人工采集/粘贴验收。便携模式使用复制的调试版 exe 与合成 portable.txt。"
+}
