@@ -1,0 +1,103 @@
+{
+  "checkedAt": "2026-11-11T02:14:23.900Z",
+  "checks": [
+    {
+      "name": "调试版以本地模式启动",
+      "passed": true
+    },
+    {
+      "name": "使用独立合成数据目录",
+      "passed": true
+    },
+    {
+      "name": "首次启动无记录",
+      "passed": true
+    },
+    {
+      "name": "数据库占用可读取且包含 v6 库文件",
+      "passed": true
+    },
+    {
+      "name": "集合重命名、排序与删除生效",
+      "passed": true
+    },
+    {
+      "name": "重名集合被拒绝",
+      "passed": true
+    },
+    {
+      "name": "合成记录已写入隔离数据库",
+      "passed": true
+    },
+    {
+      "name": "3 条合成记录通过快照读取",
+      "passed": true
+    },
+    {
+      "name": "状态包含开机启动字段",
+      "passed": true
+    },
+    {
+      "name": "批量收藏生效",
+      "passed": true
+    },
+    {
+      "name": "批量中的无效 id 在写入前被拒绝",
+      "passed": true
+    },
+    {
+      "name": "批量加入集合生效",
+      "passed": true
+    },
+    {
+      "name": "非法复制方式在写入剪贴板前被拒绝",
+      "passed": true
+    },
+    {
+      "name": "数据库占用与记录数一致",
+      "passed": true
+    },
+    {
+      "name": "整理数据库后仍返回有效占用",
+      "passed": true
+    },
+    {
+      "name": "开机启动写入当前用户 Run 项",
+      "passed": true
+    },
+    {
+      "name": "关闭开机启动移除 Run 项",
+      "passed": true
+    },
+    {
+      "name": "原生界面支持多选批量栏",
+      "passed": true
+    },
+    {
+      "name": "集合管理弹层显示原生集合",
+      "passed": true
+    },
+    {
+      "name": "设置页显示开机启动与数据库占用",
+      "passed": true
+    },
+    {
+      "name": "详情复制为菜单包含三种方式",
+      "passed": true
+    },
+    {
+      "name": "批量删除进入回收站",
+      "passed": true
+    },
+    {
+      "name": "批量恢复回到有效记录",
+      "passed": true
+    },
+    {
+      "name": "数据库为 v6 且集合顺序持久化",
+      "passed": true
+    }
+  ],
+  "clipboardReadOrWriteByTest": false,
+  "note": "隔离数据目录与合成记录；复制写回、系统通知、真实采集与粘贴仍需人工验收。"
+}
