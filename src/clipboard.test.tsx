@@ -3,13 +3,13 @@ import React, { act, StrictMode, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Clip, Snapshot } from './clipboard-service'
-const { api } = vi.hoisted(() => ({ api: { snapshot: vi.fn(), item: vi.fn(), search: vi.fn(), update: vi.fn(), purge: vi.fn(), createCollection: vi.fn(), settings: vi.fn(), copy: vi.fn(), paste: vi.fn(), image: vi.fn(), thumbnail: vi.fn(), version: vi.fn(), checkUpdate: vi.fn(), installUpdate: vi.fn(), openLink: vi.fn(), hideQuick: vi.fn(), subscribe: vi.fn(), updateMany: vi.fn(), addToCollection: vi.fn(), renameCollection: vi.fn(), deleteCollection: vi.fn(), moveCollection: vi.fn(), copyVariant: vi.fn(), dataUsage: vi.fn(), compactDatabase: vi.fn(), setAutostart: vi.fn() } }))
+const { api } = vi.hoisted(() => ({ api: { snapshot: vi.fn(), item: vi.fn(), search: vi.fn(), update: vi.fn(), purge: vi.fn(), createCollection: vi.fn(), settings: vi.fn(), copy: vi.fn(), paste: vi.fn(), image: vi.fn(), thumbnail: vi.fn(), version: vi.fn(), checkUpdate: vi.fn(), installUpdate: vi.fn(), openLink: vi.fn(), hideQuick: vi.fn(), subscribe: vi.fn(), updateMany: vi.fn(), addToCollection: vi.fn(), renameCollection: vi.fn(), deleteCollection: vi.fn(), moveCollection: vi.fn(), copyVariant: vi.fn(), copyFormat: vi.fn(), dataUsage: vi.fn(), compactDatabase: vi.fn(), setAutostart: vi.fn() } }))
 vi.mock('./clipboard-service', () => ({ clipboardService: api, native: true, errorMessage: (e: unknown) => e instanceof Error ? e.message : String(e) }))
 import App, { Editable } from './App'
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 let root: Root, host: HTMLDivElement, quickOpen: () => void, changed: () => void, data: Snapshot
 const fullText = '完整正文'.repeat(80) + '关键词在摘要之外'
-const clip: Clip = { id: 1, title: '测试记录', content: fullText, type: 'text', source: '测试应用', time: '10:00', day: '今天', capturedAt: 1794090000000, deletedAt: null, deleted: false, favorite: false, pinned: false, collections: [], note: '', fileSize: 0, fileModifiedAt: null, files: [], lastUsedAt: null, useCount: 0 }
+const clip: Clip = { id: 1, title: '测试记录', content: fullText, type: 'text', source: '测试应用', time: '10:00', day: '今天', capturedAt: 1794090000000, deletedAt: null, deleted: false, favorite: false, pinned: false, collections: [], note: '', fileSize: 0, fileModifiedAt: null, files: [], lastUsedAt: null, useCount: 0, hasHtml: false, hasRtf: false }
 const settle = async () => { for(let i = 0; i < 8; i++) await Promise.resolve() }
 const render = async (node: React.ReactNode) => { await act(async () => { root.render(node); await settle() }) }
 const click = async (selector: string) => { await act(async () => { host.querySelector<HTMLButtonElement>(selector)!.click(); await settle() }) }
@@ -188,6 +188,22 @@ describe('原生适配异步交互', () => {
     expect(api.copyVariant).toHaveBeenCalledWith(1, 'trim')
     expect(host.querySelector('.copy-menu')).toBeNull()
     expect(host.querySelector('[role="status"]')?.textContent).toContain('首尾空白')
+  })
+  it('有富文本时提供按格式复制，无富文本时不显示', async () => {
+    await render(<App/>)
+    await clickText('.primary-actions .secondary-button', '复制为')
+    expect([...host.querySelectorAll('.copy-menu button')].some(button => button.textContent?.startsWith('HTML 格式'))).toBe(false)
+    await click('.copy-menu-backdrop')
+    const rich = { ...clip, hasHtml: true, hasRtf: true }
+    data.items = [{ ...rich, content: fullText.slice(0, 240) }]
+    api.item.mockResolvedValue({ ...rich })
+    await act(async () => { changed(); await settle() })
+    await clickText('.primary-actions .secondary-button', '复制为')
+    expect([...host.querySelectorAll('.copy-menu button')].map(button => button.textContent).filter(Boolean).join(' ')).toContain('RTF 格式')
+    expect(host.querySelector('.format-badges')?.textContent).toContain('HTML')
+    await clickText('.copy-menu button', 'HTML 格式')
+    expect(api.copyFormat).toHaveBeenCalledWith(1, 'html')
+    expect(host.querySelector('[role="status"]')?.textContent).toContain('HTML 格式')
   })
   it('集合管理支持重命名与删除，删除前需确认', async () => {
     data.collections = ['素材', '灵感']

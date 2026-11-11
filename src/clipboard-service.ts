@@ -9,12 +9,13 @@ export type Clip = {
   time: string; day: string; capturedAt: number; deletedAt: number | null
   favorite: boolean; pinned: boolean; collections: string[]; note: string; deleted: boolean
   fileSize: number; fileModifiedAt: number | null; files: FileEntry[]
-  lastUsedAt: number | null; useCount: number
+  lastUsedAt: number | null; useCount: number; hasHtml: boolean; hasRtf: boolean
 }
 export type Settings = { paused: boolean; retentionDays: number; maxItems: number; shortcut: string; excludedApps: string[] }
 export type RuntimeStatus = { captureState: 'running' | 'paused' | 'error'; captureError: string | null; shortcutRegistered: boolean; shortcutError: string | null; autostart: boolean }
 export type DbUsage = { bytes: number; items: number; trashed: number }
 export type CopyMode = 'plain' | 'trim' | 'one_line'
+export type RichFormat = 'html' | 'rtf'
 export type Snapshot = { items: Clip[]; collections: string[]; settings: Settings; status: RuntimeStatus; dataDir: string; storageError: string | null }
 export type ClipPatch = Partial<Pick<Clip, 'title' | 'note' | 'favorite' | 'pinned' | 'collections' | 'deleted'>>
 export type PasteOutcome = { copied: boolean; status: 'input_sent' | 'manual_required' | 'clipboard_failed'; reason: string | null }
@@ -45,7 +46,7 @@ const demo: Snapshot = {
     const fileSize = files.reduce((sum, entry) => sum + (entry.size ?? 0), 0)
     const fileModifiedAt = files.reduce<number | null>((latest, entry) => entry.modifiedAt !== null && (latest === null || entry.modifiedAt > latest) ? entry.modifiedAt : latest, null)
     const useCount = [11, 4, 1, 7, 2, 3, 1, 5, 0, 1, 2][i] ?? 0
-    return { id: i + 1, title, content, type, source, favorite, pinned: i === 0 || i === 6, collections: collection ? [collection] : [], note: '', capturedAt, day: i < 6 ? '今天' : '昨天', time: new Date(capturedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }), deleted: i === 9, deletedAt: i === 9 ? now : null, fileSize, fileModifiedAt, files, lastUsedAt: useCount ? capturedAt + 60000 : null, useCount }
+    return { id: i + 1, title, content, type, source, favorite, pinned: i === 0 || i === 6, collections: collection ? [collection] : [], note: '', capturedAt, day: i < 6 ? '今天' : '昨天', time: new Date(capturedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }), deleted: i === 9, deletedAt: i === 9 ? now : null, fileSize, fileModifiedAt, files, lastUsedAt: useCount ? capturedAt + 60000 : null, useCount, hasHtml: i === 0 || i === 4 || i === 6, hasRtf: i === 0 }
   }),
   collections: ['日常工作', '开发片段', '灵感收集'],
   settings: { paused: false, retentionDays: 30, maxItems: 500, shortcut: 'Ctrl+Shift+V', excludedApps: [] },
@@ -56,6 +57,7 @@ const listeners = new Set<() => void>()
 function notify() { listeners.forEach(fn => fn()) }
 function demoItem(id: number) { const item = demo.items.find(c => c.id === id); if(!item) throw new Error('记录不存在'); return item }
 function demoImageFile(item: Clip) { return item.type === 'file' && item.files.length === 1 && !item.files[0].isDir && /\.(png|jpe?g|bmp)$/i.test(item.files[0].path) }
+function escapeHtml(text: string) { return text.replace(/[&<>"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[char] ?? char) }
 // Fictional inline artwork so browser previews can exercise lazy thumbnails without external files.
 function demoThumb(id: number) {
   const hue = (id * 47) % 360
@@ -130,6 +132,24 @@ export const clipboardService = {
     if(!text) throw new Error('转换后的内容为空')
     if(!navigator.clipboard) throw new Error('浏览器不支持剪贴板写入，请使用桌面版')
     await navigator.clipboard.writeText(text)
+    markDemoUsed(item); notify()
+  },
+  async copyFormat(id: number, format: RichFormat): Promise<void> {
+    if(native) return invoke('copy_item_format', { id, format })
+    const item = demoItem(id)
+    if(item.deleted) throw new Error('请先恢复这条记录')
+    if(item.type !== 'text' && item.type !== 'link') throw new Error('只有文本与链接可以按格式复制')
+    if(format === 'rtf') {
+      if(!item.hasRtf) throw new Error('这条记录没有保存 RTF 格式')
+      throw new Error('浏览器演示不支持 RTF 格式，请使用桌面版')
+    }
+    if(!item.hasHtml) throw new Error('这条记录没有保存 HTML 格式')
+    if(!navigator.clipboard || typeof ClipboardItem === 'undefined') throw new Error('浏览器不支持富文本写入，请使用桌面版')
+    const html = `<p>${escapeHtml(item.content).replace(/\r?\n/g, '<br>')}</p>`
+    await navigator.clipboard.write([new ClipboardItem({
+      'text/html': new Blob([html], { type: 'text/html' }),
+      'text/plain': new Blob([item.content], { type: 'text/plain' }),
+    })])
     markDemoUsed(item); notify()
   },
   async dataUsage(): Promise<DbUsage> {

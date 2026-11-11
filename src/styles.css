@@ -62,3 +62,5 @@
 .collection-confirm{display:flex;align-items:center;gap:10px;flex:1;font-size:11px;color:#a34a4a;flex-wrap:wrap}
 .collection-confirm>span{flex:1;min-width:120px}
 .collection-confirm>div{display:flex;gap:2px}
+.format-badges{display:flex;flex-wrap:wrap;gap:4px}
+.format-badges span{padding:1px 6px;border:1px solid #dfe5ee;border-radius:999px;background:#f7f9fc;color:#5d6b7d;font-size:10px}

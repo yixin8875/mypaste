@@ -417,6 +417,11 @@ fn copy_native(state: &AppState, id: i64) -> Result<u32> {
     } else {
         None
     };
+    let (html, rtf) = if item.kind == "text" || item.kind == "link" {
+        s.store.rich(id)?
+    } else {
+        (None, None)
+    };
     let hash = s.store.hash(id)?;
     // Clipboard writes and capture reads are serialized, including notifications racing with write return.
     s.own = None;
@@ -424,7 +429,12 @@ fn copy_native(state: &AppState, id: i64) -> Result<u32> {
         let paths: Vec<String> = item.content.split('\n').map(str::to_string).collect();
         platform::copy_files(&paths)?
     } else {
-        platform::copy(&item.content, png.as_deref())?
+        platform::copy_formats(
+            &item.content,
+            png.as_deref(),
+            html.as_deref(),
+            rtf.as_deref(),
+        )?
     };
     if platform::sequence() == sequence && platform::owns_clipboard() {
         s.own = Some(OwnWrite {
@@ -518,6 +528,68 @@ fn copy_item_variant(
             _ => "已复制为纯文本",
         };
         system_notify(&app, label);
+    }
+    Ok(())
+}
+/// Select exactly one stored rich format; a missing payload is reported before any clipboard write.
+fn select_rich(
+    format: &str,
+    html: Option<Vec<u8>>,
+    rtf: Option<Vec<u8>>,
+) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    match format {
+        "html" if html.is_none() => Err("这条记录没有保存 HTML 格式".into()),
+        "rtf" if rtf.is_none() => Err("这条记录没有保存 RTF 格式".into()),
+        "html" => Ok((html, None)),
+        "rtf" => Ok((None, rtf)),
+        _ => Err("未知的复制格式".into()),
+    }
+}
+fn copy_format_native(state: &AppState, id: i64, format: &str) -> Result<()> {
+    let mut s = lock(state)?;
+    let item = s.store.get(id)?;
+    if item.deleted {
+        return Err("Restore this item before copying".into());
+    }
+    if item.kind != "text" && item.kind != "link" {
+        return Err("只有文本与链接可以按格式复制".into());
+    }
+    let (html, rtf) = s.store.rich(id)?;
+    let (html, rtf) = select_rich(format, html, rtf)?;
+    s.own = None;
+    let sequence = platform::copy_formats(&item.content, None, html.as_deref(), rtf.as_deref())?;
+    if platform::sequence() == sequence && platform::owns_clipboard() {
+        s.own = Some(OwnWrite {
+            sequence,
+            hash: store::digest(&item.kind, item.content.as_bytes()),
+            until: Instant::now() + Duration::from_secs(1),
+        });
+    }
+    if let Err(error) = s.store.mark_used(id, store::now()) {
+        eprintln!("Usage tracking failed for item {id}: {error}");
+    }
+    Ok(())
+}
+#[tauri::command]
+fn copy_item_format(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    format: String,
+) -> Result<()> {
+    allowed(&window)?;
+    copy_format_native(&state, id, &format)?;
+    changed(&app);
+    if window.label() == "quick" {
+        system_notify(
+            &app,
+            if format == "rtf" {
+                "已复制为 RTF 格式"
+            } else {
+                "已复制为 HTML 格式"
+            },
+        );
     }
     Ok(())
 }
@@ -1363,6 +1435,7 @@ pub fn run() {
             update_items,
             add_to_collection,
             copy_item_variant,
+            copy_item_format,
             data_usage,
             compact_database,
             set_autostart
@@ -1470,6 +1543,31 @@ mod tests {
             "转换后的内容为空"
         );
         assert!(transform_text("a", "unknown").is_err());
+    }
+    #[test]
+    fn rich_format_selection_rejects_missing_and_unknown_formats() {
+        let html = b"<html><body>synthetic</body></html>".to_vec();
+        let rtf = b"{\\rtf1\\ansi synthetic}".to_vec();
+        assert_eq!(
+            select_rich("html", Some(html.clone()), Some(rtf.clone())).unwrap(),
+            (Some(html.clone()), None)
+        );
+        assert_eq!(
+            select_rich("rtf", Some(html), Some(rtf.clone())).unwrap(),
+            (None, Some(rtf))
+        );
+        assert_eq!(
+            select_rich("html", None, None).unwrap_err(),
+            "这条记录没有保存 HTML 格式"
+        );
+        assert_eq!(
+            select_rich("rtf", None, None).unwrap_err(),
+            "这条记录没有保存 RTF 格式"
+        );
+        assert_eq!(
+            select_rich("bogus", None, None).unwrap_err(),
+            "未知的复制格式"
+        );
     }
     #[test]
     fn dto_and_patch_contract() {

@@ -12,6 +12,7 @@ pub const MAX_PIXELS: usize = 20_000_000;
 pub const MAX_FILES: usize = 500;
 pub const MAX_FILE_LIST: usize = 1024 * 1024;
 pub const MAX_THUMB: usize = 512 * 1024;
+pub const MAX_RICH: usize = 1024 * 1024;
 const THUMB_EDGE: u32 = 320;
 const MAX_ID: i64 = 9_007_199_254_740_991;
 fn db(e: rusqlite::Error) -> String {
@@ -49,6 +50,8 @@ pub struct Clip {
     pub files: Vec<FileEntry>,
     pub last_used_at: Option<i64>,
     pub use_count: i64,
+    pub has_html: bool,
+    pub has_rtf: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -155,6 +158,8 @@ pub struct Capture {
     pub meta: String,
     pub source: String,
     pub thumb: Option<Vec<u8>>,
+    pub html: Option<Vec<u8>>,
+    pub rtf: Option<Vec<u8>>,
 }
 fn thumbnail(pixels: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     if width <= THUMB_EDGE && height <= THUMB_EDGE {
@@ -290,7 +295,15 @@ impl Capture {
             meta: String::new(),
             source: String::new(),
             thumb: None,
+            html: None,
+            rtf: None,
         })
+    }
+    /// Attach the optional clipboard HTML/RTF payloads to a text capture.
+    pub fn with_rich(mut self, html: Option<Vec<u8>>, rtf: Option<Vec<u8>>) -> Self {
+        self.html = html;
+        self.rtf = rtf;
+        self
     }
     /// Store only paths and a metadata snapshot; file contents are never read.
     pub fn files(entries: Vec<FileEntry>) -> Result<Self> {
@@ -354,6 +367,8 @@ impl Capture {
             meta,
             source: String::new(),
             thumb: None,
+            html: None,
+            rtf: None,
         })
     }
     pub fn with_source(mut self, source: String) -> Self {
@@ -402,6 +417,8 @@ impl Capture {
             meta: String::new(),
             source: String::new(),
             thumb: thumbnail(pixels, width as u32, height as u32),
+            html: None,
+            rtf: None,
         })
     }
 }
@@ -432,7 +449,7 @@ impl Store {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(db)?;
-        if version > 6 {
+        if version > 7 {
             return Err("Database schema is newer than this application".into());
         }
         if version == 0 {
@@ -532,6 +549,17 @@ impl Store {
             )
             .map_err(db)?;
         }
+        // v7: optional HTML and RTF payloads captured next to the plain text.
+        if current < 7 {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE items ADD COLUMN html BLOB;
+                 ALTER TABLE items ADD COLUMN rtf BLOB;
+                 PRAGMA user_version=7;
+                 COMMIT;",
+            )
+            .map_err(db)?;
+        }
         let saved: Option<String> = conn
             .query_row("SELECT value FROM settings WHERE key='settings'", [], |r| {
                 r.get(0)
@@ -561,23 +589,32 @@ impl Store {
             return Err("Capture is paused".into());
         }
         let tx = self.conn.transaction().map_err(db)?;
-        let existing: Option<(i64, String, Option<Vec<u8>>)> = tx
+        let existing: Option<(
+            i64,
+            String,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        )> = tx
             .query_row(
-                "SELECT id,content,png FROM items WHERE kind=?1 AND hash=?2",
+                "SELECT id,content,png,html,rtf FROM items WHERE kind=?1 AND hash=?2",
                 params![c.kind, c.hash],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()
             .map_err(db)?;
         let id;
-        if let Some((found, text, png)) = existing {
+        if let Some((found, text, png, old_html, old_rtf)) = existing {
             if text != c.content || png != c.png {
                 return Err("Content hash collision detected".into());
             }
             id = found;
+            // A later plain-text copy must not erase formats saved by an earlier rich copy.
+            let html = c.html.clone().or(old_html);
+            let rtf = c.rtf.clone().or(old_rtf);
             tx.execute(
-                "UPDATE items SET captured_at=?1,deleted_at=NULL,file_size=?3,file_modified=?4,meta=?5,source=?6 WHERE id=?2",
-                params![at, id, c.file_size, c.file_modified_at, c.meta, c.source],
+                "UPDATE items SET captured_at=?1,deleted_at=NULL,file_size=?3,file_modified=?4,meta=?5,source=?6,html=?7,rtf=?8 WHERE id=?2",
+                params![at, id, c.file_size, c.file_modified_at, c.meta, c.source, html, rtf],
             )
             .map_err(db)?;
         } else {
@@ -597,7 +634,7 @@ impl Store {
                     );
                 }
             }
-            tx.execute("INSERT INTO items(kind,hash,title,content,png,file_size,file_modified,meta,source,thumb,captured_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![c.kind,c.hash,c.title,c.content,c.png,c.file_size,c.file_modified_at,c.meta,c.source,c.thumb,at]).map_err(db)?;
+            tx.execute("INSERT INTO items(kind,hash,title,content,png,file_size,file_modified,meta,source,thumb,captured_at,html,rtf) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![c.kind,c.hash,c.title,c.content,c.png,c.file_size,c.file_modified_at,c.meta,c.source,c.thumb,at,c.html,c.rtf]).map_err(db)?;
             id = tx.last_insert_rowid();
             valid_id(id)?;
         }
@@ -804,9 +841,9 @@ impl Store {
     fn clip(&self, id: i64, full: bool) -> Result<Clip> {
         valid_id(id)?;
         let sql = if full {
-            "SELECT id,title,content,kind,note,favorite,captured_at,deleted_at,file_size,file_modified,meta,source,last_used,use_count,pinned FROM items WHERE id=?1"
+            "SELECT id,title,content,kind,note,favorite,captured_at,deleted_at,file_size,file_modified,meta,source,last_used,use_count,pinned,(html IS NOT NULL),(rtf IS NOT NULL) FROM items WHERE id=?1"
         } else {
-            "SELECT id,title,CASE WHEN kind='image' THEN '' ELSE substr(content,1,240) END,kind,note,favorite,captured_at,deleted_at,file_size,file_modified,'',source,last_used,use_count,pinned FROM items WHERE id=?1"
+            "SELECT id,title,CASE WHEN kind='image' THEN '' ELSE substr(content,1,240) END,kind,note,favorite,captured_at,deleted_at,file_size,file_modified,'',source,last_used,use_count,pinned,(html IS NOT NULL),(rtf IS NOT NULL) FROM items WHERE id=?1"
         };
         let mut stored_meta = String::new();
         let mut c = self
@@ -855,6 +892,8 @@ impl Store {
                     files: vec![],
                     last_used_at: r.get(12)?,
                     use_count: r.get(13)?,
+                    has_html: r.get(15)?,
+                    has_rtf: r.get(16)?,
                 })
             })
             .optional()
@@ -932,7 +971,7 @@ impl Store {
                 .conn
                 .query_row("PRAGMA backup.user_version", [], |r| r.get(0))
                 .map_err(db)?;
-            if !(4..=6).contains(&version) {
+            if !(4..=7).contains(&version) {
                 return Err("备份文件的数据库版本不受支持".into());
             }
             let integrity: String = self
@@ -946,8 +985,13 @@ impl Store {
             tx.execute_batch("DELETE FROM members; DELETE FROM collections; DELETE FROM items;")
                 .map_err(db)?;
             let pinned = if version >= 5 { "pinned" } else { "0" };
+            let rich = if version >= 7 {
+                "html,rtf"
+            } else {
+                "NULL,NULL"
+            };
             tx.execute(
-                &format!("INSERT INTO items(id,kind,hash,title,content,png,note,favorite,file_size,file_modified,meta,source,thumb,last_used,use_count,captured_at,deleted_at,pinned) SELECT id,kind,hash,title,content,png,note,favorite,file_size,file_modified,meta,source,thumb,last_used,use_count,captured_at,deleted_at,{pinned} FROM backup.items"),
+                &format!("INSERT INTO items(id,kind,hash,title,content,png,note,favorite,file_size,file_modified,meta,source,thumb,last_used,use_count,captured_at,deleted_at,pinned,html,rtf) SELECT id,kind,hash,title,content,png,note,favorite,file_size,file_modified,meta,source,thumb,last_used,use_count,captured_at,deleted_at,{pinned},{rich} FROM backup.items"),
                 [],
             )
             .map_err(db)?;
@@ -1095,6 +1139,17 @@ impl Store {
         self.conn
             .query_row("SELECT hash FROM items WHERE id=?1", [id], |r| r.get(0))
             .map_err(db)
+    }
+    /// Raw clipboard payloads; they are never sent through the snapshot API.
+    pub fn rich(&self, id: i64) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+        valid_id(id)?;
+        self.conn
+            .query_row("SELECT html,rtf FROM items WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()
+            .map_err(db)?
+            .ok_or_else(|| "Item not found".into())
     }
     /// Return a small preview for an image record or a single image file, caching it.
     pub fn thumbnail(&mut self, id: i64) -> Result<Vec<u8>> {
@@ -1253,7 +1308,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let old = store.get(1).unwrap();
         assert_eq!(old.title, "旧记录");
         assert_eq!(old.source, "未知来源");
@@ -1286,7 +1341,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let old = store.get(1).unwrap();
         assert_eq!(old.file_size, 0);
         assert!(old.files.is_empty());
@@ -1318,11 +1373,13 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let old = store.get(1).unwrap();
         assert_eq!(old.source, "未知来源");
         assert_eq!(old.use_count, 0);
         assert!(old.last_used_at.is_none());
+        assert!(!old.has_html && !old.has_rtf);
+        assert_eq!(store.rich(1).unwrap(), (None, None));
 
         let c = Capture::text("来自合成应用".into())
             .unwrap()
@@ -1336,6 +1393,45 @@ mod tests {
         assert_eq!(used.use_count, 2);
         assert_eq!(used.last_used_at, Some(base + 9));
         assert!(store.thumbnail(id).is_err());
+    }
+    #[test]
+    fn rich_formats_are_stored_merged_and_flagged() {
+        let mut store = memory();
+        let html = b"Version:0.9\r\nStartHTML:0000000105\r\nEndHTML:0000000200\r\n<html><body>synthetic</body></html>".to_vec();
+        let rtf = b"{\\rtf1\\ansi synthetic}".to_vec();
+        let base = now();
+        let first = Capture::text("富文本示例".into())
+            .unwrap()
+            .with_rich(Some(html.clone()), Some(rtf.clone()));
+        let id = store.capture(&first, base).unwrap();
+        let got = store.get(id).unwrap();
+        assert!(got.has_html && got.has_rtf);
+        assert_eq!(
+            store.rich(id).unwrap(),
+            (Some(html.clone()), Some(rtf.clone()))
+        );
+        assert!(store.list().unwrap()[0].has_html);
+
+        // Re-copying the same text as plain must not erase formats saved earlier.
+        assert_eq!(
+            store
+                .capture(&Capture::text("富文本示例".into()).unwrap(), base + 1)
+                .unwrap(),
+            id
+        );
+        assert_eq!(store.rich(id).unwrap(), (Some(html), Some(rtf)));
+
+        let html2 = b"<html><body>updated</body></html>".to_vec();
+        let rtf2 = b"{\\rtf1\\ansi updated}".to_vec();
+        store
+            .capture(
+                &Capture::text("富文本示例".into())
+                    .unwrap()
+                    .with_rich(Some(html2.clone()), Some(rtf2.clone())),
+                base + 2,
+            )
+            .unwrap();
+        assert_eq!(store.rich(id).unwrap(), (Some(html2), Some(rtf2)));
     }
     #[test]
     fn image_thumbnail_is_bounded_and_served_from_cache() {

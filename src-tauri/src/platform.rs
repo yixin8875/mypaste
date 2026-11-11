@@ -1,10 +1,11 @@
-use crate::store::{Capture, Result};
+use crate::store::{Capture, Result, MAX_RICH};
 use std::sync::mpsc::SyncSender;
 
 #[cfg(windows)]
 mod win {
     use super::*;
     use crate::store::{FileEntry, MAX_FILES, MAX_FILE_LIST, MAX_IMAGE, MAX_PIXELS};
+
     use std::{
         io::Cursor,
         ptr::null_mut,
@@ -174,6 +175,22 @@ mod win {
         let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         unsafe { RegisterClipboardFormatW(wide.as_ptr()) }
     }
+    /// Rich-text formats are optional: absence or malformed data must not block the text record.
+    fn read_rich(name: &str, limit: usize) -> Option<Vec<u8>> {
+        let id = format(name);
+        if id == 0 || unsafe { IsClipboardFormatAvailable(id) } == 0 {
+            return None;
+        }
+        read_global(id, limit).ok().filter(|data| !data.is_empty())
+    }
+    pub(super) fn valid_html(data: &[u8]) -> bool {
+        let head = String::from_utf8_lossy(&data[..data.len().min(4096)]);
+        head.contains("Version:") && head.contains("StartHTML:") && head.contains("EndHTML:")
+    }
+    pub(super) fn valid_rtf(data: &[u8]) -> bool {
+        data.starts_with(b"{\\rtf")
+            || (data.starts_with(&[0xef, 0xbb, 0xbf]) && data[3..].starts_with(b"{\\rtf"))
+    }
     fn open_clipboard(hwnd: HWND) -> Result<ClipboardGuard> {
         for attempt in 0..6 {
             if unsafe { OpenClipboard(hwnd) } != 0 {
@@ -312,7 +329,11 @@ mod win {
             if text.is_empty() {
                 return Ok(None);
             }
-            return Capture::text(text).map(Some);
+            let html = read_rich("HTML Format", MAX_RICH).filter(|data| valid_html(data));
+            let rtf = read_rich("Rich Text Format", MAX_RICH).filter(|data| valid_rtf(data));
+            return Capture::text(text)
+                .map(|capture| capture.with_rich(html, rtf))
+                .map(Some);
         }
         Ok(None)
     }
@@ -488,6 +509,20 @@ mod win {
         }
     }
     pub fn copy(text: &str, png: Option<&[u8]>) -> Result<u32> {
+        copy_formats(text, png, None, None)
+    }
+    /// Write plain text plus any stored HTML/RTF payloads in one clipboard update.
+    pub fn copy_formats(
+        text: &str,
+        png: Option<&[u8]>,
+        html: Option<&[u8]>,
+        rtf: Option<&[u8]>,
+    ) -> Result<u32> {
+        if html.is_some_and(|data| data.len() > MAX_RICH)
+            || rtf.is_some_and(|data| data.len() > MAX_RICH)
+        {
+            return Err("Rich clipboard payload exceeds 1 MiB".into());
+        }
         let hwnd = OWNER.load(Ordering::SeqCst) as HWND;
         if hwnd.is_null() {
             return Err("Clipboard owner window is unavailable".into());
@@ -536,6 +571,16 @@ mod win {
                 .flat_map(u16::to_le_bytes)
                 .collect();
             formats.push((13, bytes));
+            for (name, payload) in [("HTML Format", html), ("Rich Text Format", rtf)] {
+                let Some(payload) = payload.filter(|data| !data.is_empty()) else {
+                    continue;
+                };
+                let id = format(name);
+                if id == 0 {
+                    return Err(format!("Cannot register {name} clipboard format"));
+                }
+                formats.push((id, payload.to_vec()));
+            }
         }
         let _guard = open_clipboard(hwnd)?;
         if unsafe { EmptyClipboard() } == 0 {
@@ -768,8 +813,8 @@ mod win {
 }
 #[cfg(windows)]
 pub use win::{
-    autostart_enabled, copy, copy_files, foreground, listen, owns_clipboard, paste, read, sequence,
-    set_autostart, source_app, stop, work_area,
+    autostart_enabled, copy, copy_files, copy_formats, foreground, listen, owns_clipboard, paste,
+    read, sequence, set_autostart, source_app, stop, work_area,
 };
 #[cfg(not(windows))]
 pub fn owns_clipboard() -> bool {
@@ -820,6 +865,16 @@ pub fn listen(_: SyncSender<u32>, ready: std::sync::mpsc::Sender<Result<u32>>) {
 #[cfg(not(windows))]
 pub fn stop(_: u32) -> Result<()> {
     Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn copy_formats(
+    text: &str,
+    png: Option<&[u8]>,
+    _html: Option<&[u8]>,
+    _rtf: Option<&[u8]>,
+) -> Result<u32> {
+    copy(text, png)
 }
 
 #[cfg(not(windows))]
@@ -877,6 +932,16 @@ mod tests {
         bad[0..4].copy_from_slice(&99u32.to_le_bytes());
         assert!(win::decode_dropfiles(&bad).is_err());
         assert!(win::decode_dropfiles(&[0; 4]).is_err());
+    }
+    #[test]
+    fn rich_payload_validation_requires_native_headers() {
+        assert!(win::valid_html(
+            b"Version:0.9\r\nStartHTML:0000000105\r\nEndHTML:0000000200\r\n<html></html>"
+        ));
+        assert!(!win::valid_html(b"<html><body>plain html</body></html>"));
+        assert!(win::valid_rtf(b"{\\rtf1\\ansi synthetic}"));
+        assert!(win::valid_rtf(b"\xef\xbb\xbf{\\rtf1 synthetic}"));
+        assert!(!win::valid_rtf(b"plain text"));
     }
     #[test]
     fn synthetic_dib_size_and_channels() {

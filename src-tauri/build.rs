@@ -22,6 +22,7 @@ const COMMANDS: &[&str] = &[
     "update_items",
     "add_to_collection",
     "copy_item_variant",
+    "copy_item_format",
     "data_usage",
     "compact_database",
     "set_autostart",

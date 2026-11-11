@@ -13,6 +13,7 @@
     "allow-open-data-dir", "allow-set-data-dir",
     "allow-rename-collection", "allow-delete-collection", "allow-move-collection",
     "allow-update-items", "allow-add-to-collection", "allow-copy-item-variant",
+    "allow-copy-item-format",
     "allow-data-usage", "allow-compact-database", "allow-set-autostart",
     "updater:default", "process:allow-restart", "dialog:default"
   ]

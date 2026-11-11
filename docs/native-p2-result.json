@@ -1,0 +1,99 @@
+{
+  "checkedAt": "2026-11-11T04:36:18.236Z",
+  "checks": [
+    {
+      "name": "调试版以本地模式启动",
+      "passed": true
+    },
+    {
+      "name": "使用独立合成数据目录",
+      "passed": true
+    },
+    {
+      "name": "首次启动无记录",
+      "passed": true
+    },
+    {
+      "name": "隔离库为 v7 且包含 html/rtf 列",
+      "passed": true
+    },
+    {
+      "name": "合成记录已写入隔离数据库",
+      "passed": true
+    },
+    {
+      "name": "快照暴露富文本标记",
+      "passed": true
+    },
+    {
+      "name": "纯文本记录标记为无富文本",
+      "passed": true
+    },
+    {
+      "name": "仅 HTML 的链接记录标记正确",
+      "passed": true
+    },
+    {
+      "name": "列表摘要不携带富文本正文",
+      "passed": true
+    },
+    {
+      "name": "富文本详情菜单提供 HTML 与 RTF",
+      "passed": true
+    },
+    {
+      "name": "详情显示保存格式徽标",
+      "passed": true
+    },
+    {
+      "name": "普通文本不显示格式复制项",
+      "passed": true
+    },
+    {
+      "name": "缺少 HTML 时在写剪贴板前报错",
+      "passed": true
+    },
+    {
+      "name": "缺少 RTF 时在写剪贴板前报错",
+      "passed": true
+    },
+    {
+      "name": "未知格式在写剪贴板前报错",
+      "passed": true
+    },
+    {
+      "name": "v7 备份导出成功",
+      "passed": true
+    },
+    {
+      "name": "备份保留 v7 富文本列与数据",
+      "passed": true
+    },
+    {
+      "name": "导入 v7 备份后富文本标记保留",
+      "passed": true
+    },
+    {
+      "name": "已构造 v6 旧库用于迁移验收",
+      "passed": true
+    },
+    {
+      "name": "v6 库可启动并读取全部旧记录",
+      "passed": true
+    },
+    {
+      "name": "v6 迁移后富文本标记为空",
+      "passed": true
+    },
+    {
+      "name": "v6 已迁移到 v7 且新增列存在",
+      "passed": true
+    },
+    {
+      "name": "迁移未丢失记录",
+      "passed": true
+    }
+  ],
+  "clipboardReadOrWriteByTest": false,
+  "note": "隔离数据目录与合成记录；所有复制命令均在写入剪贴板前被拒绝，未读写真实剪贴板。真实富文本采集与回贴仍需人工验收。"
+}
