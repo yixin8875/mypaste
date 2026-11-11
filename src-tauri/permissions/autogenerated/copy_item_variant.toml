@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-copy-item-variant"
+description = "Enables the copy_item_variant command without any pre-configured scope."
+commands.allow = ["copy_item_variant"]
+
+[[permission]]
+identifier = "deny-copy-item-variant"
+description = "Denies the copy_item_variant command without any pre-configured scope."
+commands.deny = ["copy_item_variant"]

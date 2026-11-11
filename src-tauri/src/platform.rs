@@ -736,11 +736,40 @@ mod win {
             Err("已复制；修饰键未释放，请手动 Ctrl+V".into())
         }
     }
+    const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    const RUN_VALUE: &str = "MyPaste";
+    pub fn autostart_enabled() -> bool {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(RUN_KEY)
+            .and_then(|key| key.get_value::<String, _>(RUN_VALUE))
+            .is_ok()
+    }
+    pub fn set_autostart(enabled: bool) -> Result<()> {
+        use winreg::{
+            enums::{HKEY_CURRENT_USER, KEY_SET_VALUE},
+            RegKey,
+        };
+        let key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)
+            .map_err(|e| format!("无法打开开机启动注册表项：{e}"))?;
+        if enabled {
+            let exe = std::env::current_exe().map_err(|e| format!("无法读取程序路径：{e}"))?;
+            key.set_value(RUN_VALUE, &format!("\"{}\"", exe.display()))
+                .map_err(|e| format!("无法写入开机启动项：{e}"))
+        } else {
+            match key.delete_value(RUN_VALUE) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("无法删除开机启动项：{error}")),
+            }
+        }
+    }
 }
 #[cfg(windows)]
 pub use win::{
-    copy, copy_files, foreground, listen, owns_clipboard, paste, read, sequence, source_app, stop,
-    work_area,
+    autostart_enabled, copy, copy_files, foreground, listen, owns_clipboard, paste, read, sequence,
+    set_autostart, source_app, stop, work_area,
 };
 #[cfg(not(windows))]
 pub fn owns_clipboard() -> bool {
@@ -757,6 +786,14 @@ pub fn foreground() -> (isize, u32) {
 #[cfg(not(windows))]
 pub fn work_area(_: isize) -> Option<(i32, i32, i32, i32)> {
     None
+}
+#[cfg(not(windows))]
+pub fn autostart_enabled() -> bool {
+    false
+}
+#[cfg(not(windows))]
+pub fn set_autostart(_: bool) -> Result<()> {
+    Err("开机启动目前仅支持 Windows".into())
 }
 #[cfg(not(windows))]
 pub fn source_app() -> Option<String> {

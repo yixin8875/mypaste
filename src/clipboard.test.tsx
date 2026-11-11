@@ -3,7 +3,7 @@ import React, { act, StrictMode, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Clip, Snapshot } from './clipboard-service'
-const { api } = vi.hoisted(() => ({ api: { snapshot: vi.fn(), item: vi.fn(), search: vi.fn(), update: vi.fn(), purge: vi.fn(), createCollection: vi.fn(), settings: vi.fn(), copy: vi.fn(), paste: vi.fn(), image: vi.fn(), thumbnail: vi.fn(), version: vi.fn(), checkUpdate: vi.fn(), installUpdate: vi.fn(), openLink: vi.fn(), hideQuick: vi.fn(), subscribe: vi.fn() } }))
+const { api } = vi.hoisted(() => ({ api: { snapshot: vi.fn(), item: vi.fn(), search: vi.fn(), update: vi.fn(), purge: vi.fn(), createCollection: vi.fn(), settings: vi.fn(), copy: vi.fn(), paste: vi.fn(), image: vi.fn(), thumbnail: vi.fn(), version: vi.fn(), checkUpdate: vi.fn(), installUpdate: vi.fn(), openLink: vi.fn(), hideQuick: vi.fn(), subscribe: vi.fn(), updateMany: vi.fn(), addToCollection: vi.fn(), renameCollection: vi.fn(), deleteCollection: vi.fn(), moveCollection: vi.fn(), copyVariant: vi.fn(), dataUsage: vi.fn(), compactDatabase: vi.fn(), setAutostart: vi.fn() } }))
 vi.mock('./clipboard-service', () => ({ clipboardService: api, native: true, errorMessage: (e: unknown) => e instanceof Error ? e.message : String(e) }))
 import App, { Editable } from './App'
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
@@ -23,7 +23,7 @@ const openQuick = async () => { await act(async () => { quickOpen(); await settl
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r }); return { promise, resolve } }
 beforeEach(() => {
   vi.resetAllMocks()
-  data = { items: [{ ...clip, content: fullText.slice(0, 240) }], collections: [], settings: { paused: false, retentionDays: 30, maxItems: 500, shortcut: 'Ctrl+Shift+V', excludedApps: [] }, status: { captureState: 'running', captureError: null, shortcutRegistered: true, shortcutError: null }, dataDir: 'C:/synthetic-test-data', storageError: null }
+  data = { items: [{ ...clip, content: fullText.slice(0, 240) }], collections: [], settings: { paused: false, retentionDays: 30, maxItems: 500, shortcut: 'Ctrl+Shift+V', excludedApps: [] }, status: { captureState: 'running', captureError: null, shortcutRegistered: true, shortcutError: null, autostart: false }, dataDir: 'C:/synthetic-test-data', storageError: null }
   api.snapshot.mockImplementation(async () => structuredClone(data)); api.item.mockImplementation(async () => ({ ...clip })); api.search.mockResolvedValue([1])
   api.subscribe.mockImplementation(async (change, quick) => { changed = change; quickOpen = quick; return vi.fn() })
   api.update.mockResolvedValue(undefined); api.copy.mockResolvedValue(undefined); api.image.mockResolvedValue(''); api.thumbnail.mockResolvedValue(''); api.hideQuick.mockResolvedValue(undefined); api.settings.mockResolvedValue(undefined)
@@ -163,6 +163,52 @@ describe('原生适配异步交互', () => {
     expect(host.textContent).toContain('发现新版本 0.3.0')
     await clickText('.settings-modal button', '下载并安装')
     expect(api.installUpdate).toHaveBeenCalledTimes(1)
+  })
+  it('多选后批量收藏，并支持全选与取消选择', async () => {
+    data.items = [{ ...clip, id: 1, title: '第一条' }, { ...clip, id: 2, title: '第二条' }]
+    api.item.mockImplementation(async (id: number) => data.items.find(c => c.id === id)!)
+    await render(<App/>)
+    const rows = host.querySelectorAll<HTMLButtonElement>('.clip-row')
+    await act(async () => { rows[0].dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: true })); await settle() })
+    await act(async () => { rows[1].dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: true })); await settle() })
+    expect(host.querySelector('.bulk-count')?.textContent).toContain('2')
+    await clickText('.bulk-actions button', '收藏')
+    expect(api.updateMany).toHaveBeenCalledWith([1, 2], { favorite: true })
+    expect(host.querySelector('[role="status"]')?.textContent).toContain('已收藏所选记录')
+    await act(async () => { host.querySelector('.clip-list')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true })); await settle() })
+    expect(host.querySelector('.bulk-count')?.textContent).toContain('2')
+    await act(async () => { host.querySelector('.clip-list')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await settle() })
+    expect(host.querySelector('.bulk-bar')).toBeNull()
+  })
+  it('复制为菜单调用转换复制', async () => {
+    await render(<App/>)
+    await clickText('.primary-actions .secondary-button', '复制为')
+    expect(host.querySelector('.copy-menu')).not.toBeNull()
+    await clickText('.copy-menu button', '去除首尾空白')
+    expect(api.copyVariant).toHaveBeenCalledWith(1, 'trim')
+    expect(host.querySelector('.copy-menu')).toBeNull()
+    expect(host.querySelector('[role="status"]')?.textContent).toContain('首尾空白')
+  })
+  it('集合管理支持重命名与删除，删除前需确认', async () => {
+    data.collections = ['素材', '灵感']
+    await render(<App/>)
+    await click('[aria-label="管理集合"]')
+    await clickText('.collection-row button', '重命名')
+    await type(host.querySelector<HTMLInputElement>('[aria-label="重命名 素材"]')!, '写作素材')
+    await clickText('.collection-rename button', '保存')
+    expect(api.renameCollection).toHaveBeenCalledWith('素材', '写作素材')
+    await clickText('.collection-row button', '删除')
+    expect(api.deleteCollection).not.toHaveBeenCalled()
+    await clickText('.collection-confirm button', '删除集合')
+    expect(api.deleteCollection).toHaveBeenCalledWith('素材')
+  })
+  it('设置页可切换开机启动', async () => {
+    api.setAutostart.mockResolvedValue(true)
+    await render(<App/>)
+    await click('header [aria-label="设置"]')
+    await click('[aria-label="开机自动启动"]')
+    expect(api.setAutostart).toHaveBeenCalledWith(true)
+    expect(host.querySelector('[role="status"]')?.textContent).toContain('已开启开机启动')
   })
 })
 describe('编辑草稿', () => {

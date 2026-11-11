@@ -22,6 +22,7 @@ struct Status {
     capture_error: Option<String>,
     shortcut_registered: bool,
     shortcut_error: Option<String>,
+    autostart: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +56,7 @@ struct Inner {
     listener_ready: bool,
     shortcut_registered: bool,
     shortcut_error: Option<String>,
+    autostart: bool,
     baseline: u32,
     own: Option<OwnWrite>,
 }
@@ -72,6 +74,7 @@ impl Inner {
             capture_error: self.capture_error.clone(),
             shortcut_registered: self.shortcut_registered,
             shortcut_error: self.shortcut_error.clone(),
+            autostart: self.autostart,
         }
     }
 }
@@ -170,6 +173,20 @@ fn changed(app: &tauri::AppHandle) {
 fn status_changed(app: &tauri::AppHandle) {
     notify(app, "capture://status");
 }
+/// Notify through Windows when the quick window has already hidden itself, so
+/// a paste result is not lost with the window.
+fn system_notify(app: &tauri::AppHandle, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(error) = app
+        .notification()
+        .builder()
+        .title("MyPaste")
+        .body(body)
+        .show()
+    {
+        eprintln!("System notification failed: {error}");
+    }
+}
 
 #[tauri::command]
 fn get_snapshot(
@@ -239,6 +256,72 @@ fn create_collection(
 ) -> Result<()> {
     allowed(&window)?;
     lock(&state)?.store.create_collection(&name)?;
+    changed(&app);
+    Ok(())
+}
+#[tauri::command]
+fn rename_collection(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    old_name: String,
+    new_name: String,
+) -> Result<()> {
+    allowed(&window)?;
+    lock(&state)?
+        .store
+        .rename_collection(&old_name, &new_name)?;
+    changed(&app);
+    Ok(())
+}
+#[tauri::command]
+fn delete_collection(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<()> {
+    allowed(&window)?;
+    lock(&state)?.store.delete_collection(&name)?;
+    changed(&app);
+    Ok(())
+}
+#[tauri::command]
+fn move_collection(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    name: String,
+    direction: String,
+) -> Result<()> {
+    allowed(&window)?;
+    lock(&state)?.store.move_collection(&name, &direction)?;
+    changed(&app);
+    Ok(())
+}
+#[tauri::command]
+fn update_items(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    ids: Vec<i64>,
+    patch: ItemPatch,
+) -> Result<()> {
+    allowed(&window)?;
+    lock(&state)?.store.update_many(&ids, &patch)?;
+    changed(&app);
+    Ok(())
+}
+#[tauri::command]
+fn add_to_collection(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    ids: Vec<i64>,
+    name: String,
+) -> Result<()> {
+    allowed(&window)?;
+    lock(&state)?.store.add_to_collection(&ids, &name)?;
     changed(&app);
     Ok(())
 }
@@ -358,12 +441,84 @@ fn copy_native(state: &AppState, id: i64) -> Result<u32> {
 #[tauri::command]
 fn copy_item(
     window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     id: i64,
 ) -> Result<()> {
     allowed(&window)?;
     copy_native(&state, id)?;
-    changed(window.app_handle());
+    changed(&app);
+    // The quick window closes right after copying; confirm the result in the system tray area.
+    if window.label() == "quick" {
+        system_notify(&app, "已复制到剪贴板");
+    }
+    Ok(())
+}
+fn transform_text(content: &str, mode: &str) -> Result<String> {
+    let text = match mode {
+        "plain" => content.to_string(),
+        "trim" => content.trim().to_string(),
+        "one_line" => content
+            .replace("\r\n", " ")
+            .replace('\r', " ")
+            .replace('\n', " ")
+            .trim()
+            .to_string(),
+        _ => return Err("未知的复制方式".into()),
+    };
+    if text.is_empty() {
+        return Err("转换后的内容为空".into());
+    }
+    Ok(text)
+}
+fn copy_variant_native(state: &AppState, id: i64, mode: &str) -> Result<()> {
+    let mut s = lock(state)?;
+    let item = s.store.get(id)?;
+    if item.deleted {
+        return Err("Restore this item before copying".into());
+    }
+    if item.kind != "text" && item.kind != "link" {
+        return Err("只有文本与链接可以转换后复制".into());
+    }
+    let text = transform_text(&item.content, mode)?;
+    let kind = if store::http_url(&text).is_ok() {
+        "link"
+    } else {
+        "text"
+    };
+    s.own = None;
+    let sequence = platform::copy(&text, None)?;
+    if platform::sequence() == sequence && platform::owns_clipboard() {
+        s.own = Some(OwnWrite {
+            sequence,
+            hash: store::digest(kind, text.as_bytes()),
+            until: Instant::now() + Duration::from_secs(1),
+        });
+    }
+    if let Err(error) = s.store.mark_used(id, store::now()) {
+        eprintln!("Usage tracking failed for item {id}: {error}");
+    }
+    Ok(())
+}
+#[tauri::command]
+fn copy_item_variant(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    mode: String,
+) -> Result<()> {
+    allowed(&window)?;
+    copy_variant_native(&state, id, &mode)?;
+    changed(&app);
+    if window.label() == "quick" {
+        let label = match mode.as_str() {
+            "trim" => "已复制，首尾空白已去除",
+            "one_line" => "已复制为单行",
+            _ => "已复制为纯文本",
+        };
+        system_notify(&app, label);
+    }
     Ok(())
 }
 #[tauri::command]
@@ -495,7 +650,7 @@ async fn paste_item(
     })
     .await;
     release_paste(&state, request);
-    Ok(match outcome {
+    let outcome = match outcome {
         Ok(Ok(())) => PasteOutcome {
             copied: true,
             status: "input_sent",
@@ -511,7 +666,13 @@ async fn paste_item(
             status: "manual_required",
             reason: Some(format!("已复制；粘贴线程失败: {error}，请手动 Ctrl+V")),
         },
-    })
+    };
+    if outcome.status == "input_sent" && !window.is_visible().unwrap_or(true) {
+        if let Some(reason) = outcome.reason.as_deref() {
+            system_notify(&app, reason);
+        }
+    }
+    Ok(outcome)
 }
 #[tauri::command]
 fn open_link(
@@ -636,6 +797,62 @@ fn set_data_dir(
     )?;
     app.restart()
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DbUsage {
+    bytes: i64,
+    items: i64,
+    trashed: i64,
+}
+fn database_usage(state: &AppState) -> Result<DbUsage> {
+    let dir = std::path::Path::new(&state.data_dir);
+    let bytes = [
+        "history.sqlite3",
+        "history.sqlite3-wal",
+        "history.sqlite3-shm",
+    ]
+    .iter()
+    .filter_map(|name| std::fs::metadata(dir.join(name)).ok())
+    .map(|meta| meta.len() as i64)
+    .sum();
+    let (items, trashed) = lock(state)?.store.counts()?;
+    Ok(DbUsage {
+        bytes,
+        items,
+        trashed,
+    })
+}
+#[tauri::command]
+fn data_usage(window: tauri::WebviewWindow, state: tauri::State<'_, AppState>) -> Result<DbUsage> {
+    allowed(&window)?;
+    database_usage(&state)
+}
+#[tauri::command]
+fn compact_database(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+) -> Result<DbUsage> {
+    allowed(&window)?;
+    if window.label() != "main" {
+        return Err("只能从主窗口整理数据库".into());
+    }
+    lock(&state)?.store.compact()?;
+    database_usage(&state)
+}
+#[tauri::command]
+fn set_autostart(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<bool> {
+    allowed(&window)?;
+    if window.label() != "main" {
+        return Err("只能从主窗口修改开机启动".into());
+    }
+    platform::set_autostart(enabled)?;
+    lock(&state)?.autostart = enabled;
+    Ok(enabled)
+}
 
 fn quick_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow> {
     if let Some(window) = app.get_webview_window("quick") {
@@ -698,11 +915,7 @@ fn quick_focus_grace(state: &AppState) -> bool {
         .is_some_and(|at| at.elapsed() < Duration::from_millis(600))
 }
 fn show_quick_window(window: &tauri::WebviewWindow, state: &AppState) -> Result<()> {
-    let target = state
-        .quick_ui
-        .lock()
-        .map(|ui| ui.target)
-        .unwrap_or(0);
+    let target = state.quick_ui.lock().map(|ui| ui.target).unwrap_or(0);
     position_quick(window, target)?;
     if let Ok(mut ui) = state.quick_ui.lock() {
         ui.shown_at = Some(Instant::now());
@@ -1007,6 +1220,7 @@ fn setup(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Er
             listener_ready: false,
             shortcut_registered: false,
             shortcut_error: None,
+            autostart: platform::autostart_enabled(),
             baseline: platform::sequence(),
             own: None,
         })),
@@ -1112,6 +1326,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(setup)
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1141,7 +1356,16 @@ pub fn run() {
             export_backup,
             import_backup,
             open_data_dir,
-            set_data_dir
+            set_data_dir,
+            rename_collection,
+            delete_collection,
+            move_collection,
+            update_items,
+            add_to_collection,
+            copy_item_variant,
+            data_usage,
+            compact_database,
+            set_autostart
         ])
         .build(tauri::generate_context!())
         .expect("MyPaste native initialization failed");
@@ -1232,6 +1456,20 @@ mod tests {
         assert!(!trusted_url(
             &url::Url::parse("http://localhost.evil:1421").unwrap()
         ));
+    }
+    #[test]
+    fn copy_variants_trim_and_flatten_without_inventing_content() {
+        assert_eq!(transform_text("  a\r\nb  ", "plain").unwrap(), "  a\r\nb  ");
+        assert_eq!(transform_text("  a\n b \n", "trim").unwrap(), "a\n b");
+        assert_eq!(
+            transform_text("a\r\nb\rc\nd", "one_line").unwrap(),
+            "a b c d"
+        );
+        assert_eq!(
+            transform_text("  \n\t ", "one_line").unwrap_err(),
+            "转换后的内容为空"
+        );
+        assert!(transform_text("a", "unknown").is_err());
     }
     #[test]
     fn dto_and_patch_contract() {

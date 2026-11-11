@@ -133,7 +133,7 @@ impl SettingsPatch {
         Ok(s)
     }
 }
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ItemPatch {
     pub title: Option<String>,
@@ -432,7 +432,7 @@ impl Store {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(db)?;
-        if version > 5 {
+        if version > 6 {
             return Err("Database schema is newer than this application".into());
         }
         if version == 0 {
@@ -521,6 +521,17 @@ impl Store {
             )
             .map_err(db)?;
         }
+        // v6: user-defined collection order, seeded from the previous alphabetical order.
+        if current < 6 {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE collections ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+                 UPDATE collections SET position=(SELECT count(*) FROM collections c2 WHERE c2.name<collections.name);
+                 PRAGMA user_version=6;
+                 COMMIT;",
+            )
+            .map_err(db)?;
+        }
         let saved: Option<String> = conn
             .query_row("SELECT value FROM settings WHERE key='settings'", [], |r| {
                 r.get(0)
@@ -597,12 +608,12 @@ impl Store {
     pub fn collections(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT name FROM collections ORDER BY name COLLATE NOCASE")
+            .prepare("SELECT name FROM collections ORDER BY position,name COLLATE NOCASE")
             .map_err(db)?;
         let rows = stmt.query_map([], |r| r.get(0)).map_err(db)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)
     }
-    pub fn create_collection(&mut self, name: &str) -> Result<()> {
+    fn collection_name(name: &str) -> Result<&str> {
         let name = name.trim();
         if name.is_empty()
             || name.chars().count() > 80
@@ -620,8 +631,173 @@ impl Store {
         {
             return Err("Invalid or reserved collection name".into());
         }
+        Ok(name)
+    }
+    pub fn create_collection(&mut self, name: &str) -> Result<()> {
+        let name = Self::collection_name(name)?;
         self.conn
-            .execute("INSERT INTO collections(name) VALUES(?1)", [name])
+            .execute(
+                "INSERT INTO collections(name,position) VALUES(?1,(SELECT coalesce(max(position),-1)+1 FROM collections))",
+                [name],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+    pub fn rename_collection(&mut self, old: &str, new: &str) -> Result<()> {
+        let new = Self::collection_name(new)?;
+        let tx = self.conn.transaction().map_err(db)?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM collections WHERE name=?1)",
+                [old],
+                |r| r.get(0),
+            )
+            .map_err(db)?;
+        if !exists {
+            return Err("Collection not found".into());
+        }
+        if !old.eq_ignore_ascii_case(new) {
+            let duplicate: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM collections WHERE name=?1)",
+                    [new],
+                    |r| r.get(0),
+                )
+                .map_err(db)?;
+            if duplicate {
+                return Err("Collection already exists".into());
+            }
+        }
+        // The primary key compares names case-insensitively, so only a real rename
+        // needs the insert/relink/delete dance to satisfy the members foreign key.
+        if old.eq_ignore_ascii_case(new) {
+            tx.execute(
+                "UPDATE collections SET name=?2 WHERE name=?1",
+                rusqlite::params![old, new],
+            )
+            .map_err(db)?;
+        } else {
+            tx.execute(
+                "INSERT INTO collections(name,position) SELECT ?2,position FROM collections WHERE name=?1",
+                rusqlite::params![old, new],
+            )
+            .map_err(db)?;
+            tx.execute(
+                "UPDATE members SET name=?2 WHERE name=?1",
+                rusqlite::params![old, new],
+            )
+            .map_err(db)?;
+            tx.execute("DELETE FROM collections WHERE name=?1", [old])
+                .map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+        Ok(())
+    }
+    pub fn delete_collection(&mut self, name: &str) -> Result<()> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM collections WHERE name=?1", [name])
+            .map_err(db)?;
+        if removed == 0 {
+            return Err("Collection not found".into());
+        }
+        Ok(())
+    }
+    pub fn move_collection(&mut self, name: &str, direction: &str) -> Result<()> {
+        if direction != "up" && direction != "down" {
+            return Err("Invalid collection direction".into());
+        }
+        let mut names = self.collections()?;
+        let index = names
+            .iter()
+            .position(|item| item.eq_ignore_ascii_case(name))
+            .ok_or("Collection not found")?;
+        let swap = if direction == "up" {
+            index.checked_sub(1)
+        } else if index + 1 < names.len() {
+            Some(index + 1)
+        } else {
+            None
+        };
+        let Some(other) = swap else { return Ok(()) };
+        names.swap(index, other);
+        let tx = self.conn.transaction().map_err(db)?;
+        for (position, name) in names.iter().enumerate() {
+            tx.execute(
+                "UPDATE collections SET position=?1 WHERE name=?2",
+                rusqlite::params![position as i64, name],
+            )
+            .map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+        Ok(())
+    }
+    pub fn add_to_collection(&mut self, ids: &[i64], name: &str) -> Result<()> {
+        if ids.is_empty() {
+            return Err("No items selected".into());
+        }
+        if ids.len() > 1000 {
+            return Err("Too many items selected".into());
+        }
+        let tx = self.conn.transaction().map_err(db)?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM collections WHERE name=?1)",
+                [name],
+                |r| r.get(0),
+            )
+            .map_err(db)?;
+        if !exists {
+            return Err("Collection not found".into());
+        }
+        for id in ids {
+            valid_id(*id)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO members(item_id,name) VALUES(?1,?2)",
+                rusqlite::params![id, name],
+            )
+            .map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+        Ok(())
+    }
+    pub fn update_many(&mut self, ids: &[i64], patch: &ItemPatch) -> Result<()> {
+        if ids.is_empty() {
+            return Err("No items selected".into());
+        }
+        if ids.len() > 1000 {
+            return Err("Too many items selected".into());
+        }
+        // Validate every target before the first write so a bad id cannot leave a half-applied batch.
+        for id in ids {
+            let item = self.get(*id)?;
+            if item.deleted
+                && (patch.title.is_some()
+                    || patch.note.is_some()
+                    || patch.favorite.is_some()
+                    || patch.pinned.is_some()
+                    || patch.collections.is_some())
+            {
+                return Err("Restore an item before editing it".into());
+            }
+        }
+        for id in ids {
+            self.update(*id, patch.clone())?;
+        }
+        Ok(())
+    }
+    pub fn counts(&self) -> Result<(i64, i64)> {
+        self.conn
+            .query_row(
+                "SELECT coalesce(sum(deleted_at IS NULL),0), coalesce(sum(deleted_at IS NOT NULL),0) FROM items",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(db)
+    }
+    pub fn compact(&mut self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA optimize; VACUUM;")
             .map_err(db)?;
         Ok(())
     }
@@ -743,9 +919,7 @@ impl Store {
     }
     pub fn export_to(&mut self, path: &Path) -> Result<()> {
         let target = path.to_str().ok_or("Backup path is not valid UTF-8")?;
-        self.conn
-            .execute("VACUUM INTO ?1", [target])
-            .map_err(db)?;
+        self.conn.execute("VACUUM INTO ?1", [target]).map_err(db)?;
         Ok(())
     }
     pub fn import_from(&mut self, path: &Path) -> Result<()> {
@@ -758,7 +932,7 @@ impl Store {
                 .conn
                 .query_row("PRAGMA backup.user_version", [], |r| r.get(0))
                 .map_err(db)?;
-            if !(4..=5).contains(&version) {
+            if !(4..=6).contains(&version) {
                 return Err("备份文件的数据库版本不受支持".into());
             }
             let integrity: String = self
@@ -777,8 +951,9 @@ impl Store {
                 [],
             )
             .map_err(db)?;
+            let position = if version >= 6 { "position" } else { "0" };
             tx.execute(
-                "INSERT INTO collections(name) SELECT name FROM backup.collections",
+                &format!("INSERT INTO collections(name,position) SELECT name,{position} FROM backup.collections"),
                 [],
             )
             .map_err(db)?;
@@ -1078,7 +1253,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let old = store.get(1).unwrap();
         assert_eq!(old.title, "旧记录");
         assert_eq!(old.source, "未知来源");
@@ -1111,7 +1286,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let old = store.get(1).unwrap();
         assert_eq!(old.file_size, 0);
         assert!(old.files.is_empty());
@@ -1143,7 +1318,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let old = store.get(1).unwrap();
         assert_eq!(old.source, "未知来源");
         assert_eq!(old.use_count, 0);
@@ -1413,6 +1588,40 @@ mod tests {
         assert!(http_url("javascript:alert(1)").is_err());
         assert_eq!(text(" https://example.com/path ").kind, "link");
         assert_eq!(text("https://example.com two").kind, "text");
+    }
+    #[test]
+    fn collection_rename_delete_order_and_batch_updates() {
+        let mut s = memory();
+        let a = s.capture(&text("alpha synthetic"), now()).unwrap();
+        let b = s.capture(&text("beta synthetic"), now() + 1).unwrap();
+        assert!(s.add_to_collection(&[a], "missing").is_err());
+        s.create_collection("Work").unwrap();
+        s.create_collection("Play").unwrap();
+        assert_eq!(s.collections().unwrap(), vec!["Work", "Play"]);
+        s.move_collection("Play", "up").unwrap();
+        assert_eq!(s.collections().unwrap(), vec!["Play", "Work"]);
+        s.move_collection("Play", "up").unwrap();
+        assert_eq!(s.collections().unwrap(), vec!["Play", "Work"]);
+        s.add_to_collection(&[a, b], "Work").unwrap();
+        assert_eq!(s.get(a).unwrap().collections, vec!["Work"]);
+        s.rename_collection("Work", "Studio").unwrap();
+        assert_eq!(s.get(a).unwrap().collections, vec!["Studio"]);
+        assert_eq!(s.collections().unwrap(), vec!["Play", "Studio"]);
+        assert!(s.rename_collection("Studio", "play").is_err());
+        s.delete_collection("Studio").unwrap();
+        assert!(s.get(a).unwrap().collections.is_empty());
+        assert!(s.get(b).unwrap().collections.is_empty());
+        s.update_many(
+            &[a, b],
+            &ItemPatch {
+                favorite: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(s.get(a).unwrap().favorite);
+        assert!(s.get(b).unwrap().favorite);
+        assert!(s.update_many(&[], &ItemPatch::default()).is_err());
     }
     #[test]
     fn default_501st_item_trashes_oldest_but_snapshot_is_complete() {

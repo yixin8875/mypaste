@@ -12,7 +12,9 @@ export type Clip = {
   lastUsedAt: number | null; useCount: number
 }
 export type Settings = { paused: boolean; retentionDays: number; maxItems: number; shortcut: string; excludedApps: string[] }
-export type RuntimeStatus = { captureState: 'running' | 'paused' | 'error'; captureError: string | null; shortcutRegistered: boolean; shortcutError: string | null }
+export type RuntimeStatus = { captureState: 'running' | 'paused' | 'error'; captureError: string | null; shortcutRegistered: boolean; shortcutError: string | null; autostart: boolean }
+export type DbUsage = { bytes: number; items: number; trashed: number }
+export type CopyMode = 'plain' | 'trim' | 'one_line'
 export type Snapshot = { items: Clip[]; collections: string[]; settings: Settings; status: RuntimeStatus; dataDir: string; storageError: string | null }
 export type ClipPatch = Partial<Pick<Clip, 'title' | 'note' | 'favorite' | 'pinned' | 'collections' | 'deleted'>>
 export type PasteOutcome = { copied: boolean; status: 'input_sent' | 'manual_required' | 'clipboard_failed'; reason: string | null }
@@ -47,7 +49,7 @@ const demo: Snapshot = {
   }),
   collections: ['日常工作', '开发片段', '灵感收集'],
   settings: { paused: false, retentionDays: 30, maxItems: 500, shortcut: 'Ctrl+Shift+V', excludedApps: [] },
-  status: { captureState: 'running', captureError: null, shortcutRegistered: false, shortcutError: null }, dataDir: '', storageError: null,
+  status: { captureState: 'running', captureError: null, shortcutRegistered: false, shortcutError: null, autostart: false }, dataDir: '', storageError: null,
 }
 let pendingUpdate: Update | null = null
 const listeners = new Set<() => void>()
@@ -82,6 +84,65 @@ export const clipboardService = {
     if(native) return invoke('purge_item', { id })
     if(!demoItem(id).deleted) throw new Error('只能彻底删除回收站中的记录')
     demo.items = demo.items.filter(c => c.id !== id); notify()
+  },
+  async updateMany(ids: number[], patch: ClipPatch): Promise<void> {
+    if(native) return invoke('update_items', { ids, patch })
+    for(const id of ids) {
+      const item = demoItem(id); Object.assign(item, patch)
+      if(patch.deleted !== undefined) item.deletedAt = patch.deleted ? Date.now() : null
+    }
+    notify()
+  },
+  async addToCollection(ids: number[], name: string): Promise<void> {
+    if(native) return invoke('add_to_collection', { ids, name })
+    if(!demo.collections.includes(name)) throw new Error('集合不存在')
+    for(const id of ids) { const item = demoItem(id); if(!item.collections.includes(name)) item.collections.push(name) }
+    notify()
+  },
+  async renameCollection(oldName: string, newName: string): Promise<void> {
+    if(native) return invoke('rename_collection', { oldName, newName })
+    const name = newName.trim()
+    if(!name || demo.collections.includes(name)) throw new Error('集合名称为空或已存在')
+    demo.collections = demo.collections.map(value => value === oldName ? name : value)
+    for(const item of demo.items) item.collections = item.collections.map(value => value === oldName ? name : value)
+    notify()
+  },
+  async deleteCollection(name: string): Promise<void> {
+    if(native) return invoke('delete_collection', { name })
+    demo.collections = demo.collections.filter(value => value !== name)
+    for(const item of demo.items) item.collections = item.collections.filter(value => value !== name)
+    notify()
+  },
+  async moveCollection(name: string, direction: 'up' | 'down'): Promise<void> {
+    if(native) return invoke('move_collection', { name, direction })
+    const index = demo.collections.indexOf(name)
+    const other = direction === 'up' ? index - 1 : index + 1
+    if(index < 0 || other < 0 || other >= demo.collections.length) return
+    ;[demo.collections[index], demo.collections[other]] = [demo.collections[other], demo.collections[index]]
+    notify()
+  },
+  async copyVariant(id: number, mode: CopyMode): Promise<void> {
+    if(native) return invoke('copy_item_variant', { id, mode })
+    const item = demoItem(id)
+    if(item.deleted) throw new Error('请先恢复这条记录')
+    if(item.type !== 'text' && item.type !== 'link') throw new Error('只有文本与链接可以转换后复制')
+    const text = mode === 'trim' ? item.content.trim() : mode === 'one_line' ? item.content.replace(/\r\n/g, ' ').replace(/[\r\n]/g, ' ').trim() : item.content
+    if(!text) throw new Error('转换后的内容为空')
+    if(!navigator.clipboard) throw new Error('浏览器不支持剪贴板写入，请使用桌面版')
+    await navigator.clipboard.writeText(text)
+    markDemoUsed(item); notify()
+  },
+  async dataUsage(): Promise<DbUsage> {
+    if(native) return invoke('data_usage')
+    return { bytes: 0, items: demo.items.filter(c => !c.deleted).length, trashed: demo.items.filter(c => c.deleted).length }
+  },
+  async compactDatabase(): Promise<DbUsage> {
+    if(native) return invoke('compact_database')
+    return { bytes: 0, items: demo.items.filter(c => !c.deleted).length, trashed: demo.items.filter(c => c.deleted).length }
+  },
+  async setAutostart(enabled: boolean): Promise<boolean> {
+    if(native) return invoke('set_autostart', { enabled })
+    throw new Error('浏览器演示不支持开机启动')
   },
   async exportBackup(): Promise<string | null> {
     if(!native) throw new Error('浏览器演示不支持导出备份')

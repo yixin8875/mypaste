@@ -16,6 +16,15 @@ const COMMANDS: &[&str] = &[
     "import_backup",
     "open_data_dir",
     "set_data_dir",
+    "rename_collection",
+    "delete_collection",
+    "move_collection",
+    "update_items",
+    "add_to_collection",
+    "copy_item_variant",
+    "data_usage",
+    "compact_database",
+    "set_autostart",
 ];
 fn main() {
     tauri_build::try_build(
