@@ -194,7 +194,7 @@ export const clipboardService = {
     const text = mode === 'trim' ? item.content.trim() : mode === 'one_line' ? item.content.replace(/\r\n/g, ' ').replace(/[\r\n]/g, ' ').trim() : item.content
     if(!text) throw new Error('转换后的内容为空')
     if(!navigator.clipboard) throw new Error('浏览器不支持剪贴板写入，请使用桌面版')
-    await navigator.clipboard.writeText(text)
+    try { await navigator.clipboard.writeText(text) } catch { throw new Error('浏览器未能写入剪贴板，请先点击页面再试，或使用桌面版') }
     markDemoUsed(item); notify()
   },
   async copyFormat(id: number, format: RichFormat): Promise<void> {
@@ -209,10 +209,12 @@ export const clipboardService = {
     if(!item.hasHtml) throw new Error('这条记录没有保存 HTML 格式')
     if(!navigator.clipboard || typeof ClipboardItem === 'undefined') throw new Error('浏览器不支持富文本写入，请使用桌面版')
     const html = `<p>${escapeHtml(item.content).replace(/\r?\n/g, '<br>')}</p>`
-    await navigator.clipboard.write([new ClipboardItem({
-      'text/html': new Blob([html], { type: 'text/html' }),
-      'text/plain': new Blob([item.content], { type: 'text/plain' }),
-    })])
+    try {
+      await navigator.clipboard.write([new ClipboardItem({
+        'text/html': new Blob([html], { type: 'text/html' }),
+        'text/plain': new Blob([item.content], { type: 'text/plain' }),
+      })])
+    } catch { throw new Error('浏览器未能写入剪贴板，请先点击页面再试，或使用桌面版') }
     markDemoUsed(item); notify()
   },
   async dataUsage(): Promise<DbUsage> {
@@ -274,7 +276,7 @@ export const clipboardService = {
     if(item.type === 'image') throw new Error('浏览器图片为示例，请在桌面版复制真实图片')
     if(item.type === 'file') throw new Error('浏览器文件为示例，请在桌面版复制真实文件')
     if(!navigator.clipboard) throw new Error('浏览器不支持剪贴板写入，请使用桌面版')
-    await navigator.clipboard.writeText(item.content)
+    try { await navigator.clipboard.writeText(item.content) } catch { throw new Error('浏览器未能写入剪贴板，请先点击页面再试，或使用桌面版') }
     markDemoUsed(item); notify()
   },
   async paste(id: number): Promise<PasteOutcome> {
