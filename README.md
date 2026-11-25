@@ -1,6 +1,6 @@
 # MyPaste
 
-参考 1Password 桌面端风格的本地剪贴板管理器，采用 **Tauri 2 + Rust + React + TypeScript + TailwindCSS 4**。当前包含 Windows 原生工程与浏览器演示两种运行模式。
+参考 1Password 桌面端风格的本地剪贴板管理器，采用 **Tauri 2 + Rust + React + TypeScript + TailwindCSS 4**，界面组件来自 **coss ui**（Base UI）。当前包含 Windows 原生工程与浏览器演示两种运行模式。
 
 ## 启动 Windows 桌面版
 
