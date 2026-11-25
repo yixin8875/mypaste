@@ -16,7 +16,7 @@ export function Topbar({ heading, nativeMode, shortcut, onOpenSidebar, onOpenQui
       <IconButton className="-ml-1 min-[951px]:hidden" label="打开导航" onClick={onOpenSidebar}><Menu size={17} /></IconButton>
       <div className="min-w-0 truncate text-[12px] font-medium text-muted-foreground">{heading}</div>
       <div className="ml-auto flex items-center gap-2.5">
-        <Badge className="max-[950px]:hidden" variant="outline">{nativeMode ? '本地模式' : '浏览器演示'}</Badge>
+        <Badge className="prototype-badge max-[950px]:hidden" variant="outline">{nativeMode ? '本地模式' : '浏览器演示'}</Badge>
         <button
           className="quiet-button inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[12px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           onClick={onOpenQuick}
